@@ -60,6 +60,8 @@ int main(void)
     sceCtrlSetSamplingCycle(0);
     sceCtrlSetSamplingMode(PSP_CTRL_MODE_ANALOG);
     r_init();
+    game_loading();
+    game_loading();   /* due volte: riempie entrambi i buffer dello schermo */
 
     game_init();
     {

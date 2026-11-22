@@ -1856,7 +1856,6 @@ static Voice voices[NVOICE];
 static unsigned anoise = 22222u;
 static float rev_buf[16384];
 static int rev_pos;
-static double mus_t;
 static float mel_ph, mel_env, mel_f, pad_ph[4], kick_env, kick_ph;
 static int mus_step;
 
@@ -1897,52 +1896,56 @@ static void sfx_play(int id)
 }
 
 /* scala di La minore naturale: frequenze delle note usate dalla musica */
-static float note_hz(int n) { return 220.0f * powf(2.0f, n / 12.0f); }
+static float note_hz(int n) { return 220.0f * powf(2.0f, n / 12.0f); }   /* chiamata solo una volta per blocco */
 
 void game_audio_fill(int16_t *out, int frames)
 {
     static const int chords[4][3] = { {0, 3, 7}, {-4, 0, 3}, {3, 7, 10}, {-2, 2, 5} };   /* Lam, Fa, Do, Sol */
     static const int scale[7] = { 0, 2, 3, 5, 7, 8, 10 };
-    int i, k;
+    static unsigned samples;            /* contatore di campioni (intero: niente doppia precisione) */
+    static float pad_f[4], pad_amp[3];
+    int i, k, chord, step, mm = music_mode;
+    float bpm = mm == 2 ? 112.0f : 58.0f, beat, dt = 2.0f / AUDIO_RATE;   /* sintesi a 22 kHz */
+    float mdecay = mm == 2 ? 0.9997f : 0.99986f, kdecay = 0.9988f, gain = mm == 0 ? 0.8f : (mm == 3 ? 1.1f : 1.0f);
     if (!sine_tab[SINE_N / 4]) for (i = 0; i < SINE_N; i++) sine_tab[i] = (int16_t)(sinf(i * 2 * PI / SINE_N) * 32767);
     while (sfxr != sfxw) { sfx_play(sfxq[sfxr]); sfxr = (sfxr + 1) & 31; }
-    for (i = 0; i < frames; i++) {
-        float l = 0, r = 0, m = 0, dt = 1.0f / AUDIO_RATE;
-        int mm = music_mode;
-        float bpm = mm == 2 ? 112.0f : 58.0f;
-        double beat = mus_t * bpm / 60.0;
-        int step = (int)(beat * 2);
-        int chord = ((int)(beat / 8)) & 3;
-        /* pad: accordo lento e morbido */
+    /* parametri della musica calcolati una volta per blocco */
+    beat = (float)(samples % (AUDIO_RATE * 600u)) * bpm / (60.0f * AUDIO_RATE);
+    chord = ((int)(beat / 8)) & 3;
+    step = (int)(beat * 2);
+    for (k = 0; k < 3; k++) {
+        pad_f[k] = note_hz(chords[chord][k] - 12);
+        pad_amp[k] = 0.045f + 0.02f * tsin(beat * 0.05f + k * 0.33f);
+    }
+    pad_f[3] = note_hz(chords[chord][0] - 24);
+    if (step != mus_step) {
+        unsigned h = (unsigned)step * 2654435761u;
+        mus_step = step;
+        if ((mm == 2 && (h >> 7) % 2 == 0) || (mm != 2 && (h >> 9) % 3 == 0)) {
+            int deg = (int)((h >> 13) % 7), oct = (int)((h >> 17) % 2);
+            mel_f = note_hz(scale[deg] + 12 * oct + (mm == 2 ? -12 : 0));
+            mel_env = 1;
+        }
+        if (mm == 2 && step % 2 == 0) { kick_env = 1; kick_ph = 0; }
+    }
+    for (i = 0; i < frames; i += 2) {
+        float l = 0, r = 0, m = 0;
         for (k = 0; k < 3; k++) {
-            float f = note_hz(chords[chord][k] - 12);
-            pad_ph[k] += f * dt; if (pad_ph[k] > 1) pad_ph[k] -= 1;
-            m += tsin(pad_ph[k]) * (0.045f + 0.02f * tsin((float)(mus_t * 0.1 + k * 0.33)));
+            pad_ph[k] += pad_f[k] * dt; if (pad_ph[k] > 1) pad_ph[k] -= 1;
+            m += tsin(pad_ph[k]) * pad_amp[k];
         }
-        pad_ph[3] += note_hz(chords[chord][0] - 24) * dt; if (pad_ph[3] > 1) pad_ph[3] -= 1;
+        pad_ph[3] += pad_f[3] * dt; if (pad_ph[3] > 1) pad_ph[3] -= 1;
         m += tsin(pad_ph[3]) * 0.06f;                                 /* bordone grave */
-        /* melodia: note sparse come campane lontane */
-        if (step != mus_step) {
-            unsigned h = (unsigned)step * 2654435761u;
-            mus_step = step;
-            if ((mm == 2 && (h >> 7) % 2 == 0) || (mm != 2 && (h >> 9) % 3 == 0)) {
-                int deg = (int)((h >> 13) % 7), oct = (int)((h >> 17) % 2);
-                mel_f = note_hz(scale[deg] + 12 * oct + (mm == 2 ? -12 : 0));
-                mel_env = 1;
-            }
-            if (mm == 2 && step % 2 == 0) { kick_env = 1; kick_ph = 0; }
-        }
         mel_ph += mel_f * dt; if (mel_ph > 1) mel_ph -= 1;
         m += (tsin(mel_ph) + 0.3f * tsin(mel_ph * 2.0f)) * mel_env * 0.09f;
-        mel_env *= mm == 2 ? 0.99985f : 0.99993f;
+        mel_env *= mdecay;
         if (kick_env > 0.001f) {   /* tamburo del combattimento */
-            kick_ph += (50 + 90 * kick_env) * dt;
+            kick_ph += (50 + 90 * kick_env) * dt; if (kick_ph > 1) kick_ph -= 1;
             m += tsin(kick_ph) * kick_env * 0.35f;
-            kick_env *= 0.9994f;
+            kick_env *= kdecay;
         }
-        if (mm == 0) m *= 0.8f;
-        if (mm == 3) m *= 1.1f;
-        l += m; r += m;
+        m *= gain;
+        l = m; r = m;
         /* effetti */
         for (k = 0; k < NVOICE; k++) {
             Voice *v = &voices[k];
@@ -1953,26 +1956,27 @@ void game_audio_fill(int16_t *out, int frames)
             if (v->t < 0.005f) env *= v->t / 0.005f;
             f = v->f0 + (v->f1 - v->f0) * (v->t / v->dur);
             v->ph += f * dt; if (v->ph > 1) v->ph -= 1;
-            if (v->wave == 1) s = v->ph < 0.5f ? 0.6f : -0.6f;           /* quadra morbida */
-            else if (v->wave == 2) s = tsin(v->ph) + 0.4f * tsin(v->ph * 2.76f);   /* campana */
+            if (v->wave == 1) s = v->ph < 0.5f ? 0.6f : -0.6f;
+            else if (v->wave == 2) s = tsin(v->ph) + 0.4f * tsin(v->ph * 2.76f);
             else s = tsin(v->ph);
-            s = s * (1 - v->noise) + nrand() * v->noise;
+            if (v->noise > 0) s = s * (1 - v->noise) + nrand() * v->noise;
             s *= env * env * v->vol;
             l += s * (1.2f - v->pan); r += s * (0.2f + v->pan);
             v->t += dt;
         }
-        /* riverbero semplice: dà profondità alla musica e ai suoni */
+        /* riverbero semplice */
         {
             float e = rev_buf[rev_pos];
             rev_buf[rev_pos] = (l + r) * 0.25f + e * 0.55f;
-            rev_pos = (rev_pos + 1) % 13230;
+            rev_pos++; if (rev_pos >= 6615) rev_pos = 0;
             l += e * 0.4f; r += e * 0.4f;
         }
         if (l > 1) l = 1; if (l < -1) l = -1;
         if (r > 1) r = 1; if (r < -1) r = -1;
-        out[i * 2] = (int16_t)(l * 26000); out[i * 2 + 1] = (int16_t)(r * 26000);
-        mus_t += dt;
+        out[i * 2] = out[i * 2 + 2] = (int16_t)(l * 26000);
+        out[i * 2 + 1] = out[i * 2 + 3] = (int16_t)(r * 26000);
     }
+    samples += (unsigned)frames;
 }
 
 /* ------------------------------------------------------------------ */
@@ -4716,6 +4720,18 @@ void game_render(void)
         }
         if (winT > 90) text_c(200, 2, RGB(160, 150, 135), "START  CONTINUA");
     }
+    r_end();
+}
+
+/* schermata mostrata subito all'avvio, mentre il mondo viene generato */
+void game_loading(void)
+{
+    V3 e = v3(0, 0, 0), t = v3(0, 0, -1);
+    r_begin(RGB(8, 6, 10), e, t, 100, 200, RGB(0, 0, 0));
+    r_begin2d();
+    rectf(0, 0, SW, SH, RGB(8, 6, 10));
+    text_c(110, 4, RGB(230, 210, 175), "CENERE DI VELMORA");
+    text_c(150, 2, RGB(170, 160, 150), "CARICAMENTO...");
     r_end();
 }
 

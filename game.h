@@ -18,6 +18,8 @@ typedef struct {
 } Input;
 
 void game_init(void);
+/* schermata di caricamento (prima di game_init) */
+void game_loading(void);
 void game_update(const Input *in);
 /* disegna il frame tramite render.h */
 void game_render(void);

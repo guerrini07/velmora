@@ -2,7 +2,7 @@ TARGET = velmora
 OBJS = main_psp.o game.o render_gu.o
 
 INCDIR =
-CFLAGS = -O2 -G0 -Wall
+CFLAGS = -O2 -G0 -Wall -fsingle-precision-constant
 CXXFLAGS = $(CFLAGS) -fno-exceptions -fno-rtti
 ASFLAGS = $(CFLAGS)
 
