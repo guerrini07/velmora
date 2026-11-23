@@ -22,7 +22,7 @@
 #define WL (-5.0f)        /* livello dell'acqua del lago */
 #define TS 16
 #define MAXE 96
-#define MAXPART 128
+#define MAXPART 192
 #define PI 3.14159265f
 
 /* T_LAMP e' attraversabile; da T_GRAVE in su gli oggetti sono solidi */
@@ -45,6 +45,10 @@ static int mode, frame, shake, deadT, winT;
 static char msg[48];
 static int msgT;
 static int gate_closed;
+#ifdef GAME_DEBUG
+float dbg_cam;
+int dbg_noen, dbg_nopl;
+#endif
 static float camYaw = -PI / 2, camX, camZ, camPitch = 0.36f, camDistS = 62.0f;
 static int lTap, lUsed;
 static float camGY;
@@ -110,8 +114,8 @@ static struct {
     int vig, end, str, lvl;
     unsigned buf; int bufT;
     int lock;            /* -1 nessuno, 0..NE-1 nemico, 100 boss */
-    float rx, ry, walk;
-    int maxFlask, region;
+    float rx, ry, walk, vx, vy, charge;
+    int maxFlask, region, crossT, sprint, combo, backstep;
 } P;
 
 static struct {
@@ -162,7 +166,7 @@ static Wave waves[MAXWAVE];
 
 
 
-typedef struct { float x, y, vx, vy; int life; uint32_t col; } Part;
+typedef struct { float x, y, vx, vy, h, vh; int life; uint32_t col; } Part;
 static Part parts[MAXPART];
 
 /* macchie di sangue sul selciato */
@@ -184,6 +188,9 @@ static void rb_player_hits(float range, int dmg);
 static void rb_update(void);
 static void rb_reset_all(void);
 static void rb_shift(float ox, float oy);
+static float shockX, shockY; static int shockT;   /* onda d'urto del colpo pesante */
+enum { TRMAX = 18 };
+static int trN;   /* scia della lama */
 static void rb_draw(void);
 static void draw_npc(void);
 static int near_npc(void);
@@ -848,6 +855,14 @@ static int move_circle(float *x, float *y, float r, float dx, float dy)
 /* ------------------------------------------------------------------ */
 /* particelle e messaggi                                               */
 /* ------------------------------------------------------------------ */
+typedef struct { float x, y, h; int t; } HitFx;
+static HitFx hfx[6];
+static void spawn_hitfx(float x, float y, float h)
+{
+    int i, best = 0;
+    for (i = 0; i < 6; i++) if (hfx[i].t < hfx[best].t) best = i;
+    hfx[best].x = x; hfx[best].y = y; hfx[best].h = h; hfx[best].t = 9;
+}
 static void spawn_parts(float x, float y, int n, uint32_t col, float spd)
 {
     int i;
@@ -858,6 +873,7 @@ static void spawn_parts(float x, float y, int n, uint32_t col, float spd)
             parts[i].vx = cosf(a) * s; parts[i].vy = sinf(a) * s;
             parts[i].life = 14 + (int)(rnd() % 14);
             parts[i].col = col;
+            parts[i].h = 7 + frnd() * 6; parts[i].vh = 0.6f + frnd() * 1.4f;   /* arco balistico */
             n--;
         }
 }
@@ -1019,7 +1035,10 @@ static void move_window(int nx0, int ny0)
     drop.x -= ox; drop.y -= oy;
     for (i = 0; i < MAXPART; i++) { parts[i].x -= ox; parts[i].y -= oy; }
     for (i = 0; i < MAXBLOOD; i++) { blood[i].x -= ox; blood[i].y -= oy; }
+    for (i = 0; i < 6; i++) { hfx[i].x -= ox; hfx[i].y -= oy; }
+    shockX -= ox; shockY -= oy;
     rb_shift(ox, oy);
+    trN = 0;
     for (i = 0; i < NE; i++) {
         if (!E[i].alive) continue;
         E[i].x -= ox; E[i].y -= oy;
@@ -1131,12 +1150,18 @@ static void hurt_player(int dmg, float sx, float sy)
 /* ------------------------------------------------------------------ */
 /* attacchi del giocatore                                              */
 /* ------------------------------------------------------------------ */
-static const int AW[2] = { 7, 18 }, AA[2] = { 6, 7 }, AR[2] = { 13, 20 };
+enum { AT_L1, AT_HEAVY, AT_L2, AT_L3, AT_RUN };
+static const int AW[5] = { 7, 16, 6, 8, 7 }, AA[5] = { 6, 6, 6, 9, 7 }, AR[5] = { 12, 20, 12, 18, 16 };
+static const float ASTEP[5] = { 1.7f, 1.8f, 1.7f, 2.6f, 3.6f };    /* avanzamento durante il colpo */
+static const float ARANGE[5] = { 33, 40, 33, 34, 36 };
+static const float ADMG[5] = { 1.0f, 1.0f, 1.05f, 1.45f, 1.3f };
+static const int ACOST[5] = { 15, 30, 14, 20, 22 };
+static int hitstop;      /* congelamento di qualche frame quando un colpo va a segno */
 
 static void player_hits(void)
 {
-    float range = P.atk ? 38.0f : 31.0f;
-    int dmg = P.atk ? dmgH() : dmgL();
+    float range = ARANGE[P.atk];
+    int dmg = P.atk == AT_HEAVY ? dmgH() + (int)(P.charge * dmgH() / 30) : (int)(dmgL() * ADMG[P.atk]);
     int i;
     rb_player_hits(range, dmg);
     for (i = 0; i < NE; i++) {
@@ -1144,12 +1169,15 @@ static void player_hits(void)
         float dx, dy, d;
         if (!e->alive || e->state == ES_DEAD || e->hitBy == P.atkId) continue;
         dx = e->x - P.x; dy = e->y - P.y; d = sqrtf(dx * dx + dy * dy) + 0.001f;
-        if (d < range + EK[e->kind].r && (dx * P.fx + dy * P.fy) / d > 0.25f) {
+        if (d < range + EK[e->kind].r && (P.atk == AT_L3 || (dx * P.fx + dy * P.fy) / d > 0.25f)) {
             e->hitBy = P.atkId;
             e->hp -= dmg;
             e->flash = 6;
-            spawn_parts(e->x, e->y, 10, RGB(140, 12, 20), 2.2f);
+            spawn_parts(e->x, e->y, 16, RGB(120, 8, 14), 2.6f);
+            spawn_parts(e->x - dx / d * 4, e->y - dy / d * 4, 5, RGB(255, 190, 110), 3.0f);
+            spawn_hitfx(e->x - dx / d * 4, e->y - dy / d * 4, EK[e->kind].r > 9 ? 16.0f : 11.0f);
             sfx(SFX_HIT);
+            hitstop = P.atk == AT_HEAVY ? 6 : 3;
             add_blood(e->x + dx / d * 6, e->y + dy / d * 6, 2.5f + frnd() * 3);
             move_circle(&e->x, &e->y, EK[e->kind].r, dx / d * 4, dy / d * 4);
             if (e->hp <= 0) {
@@ -1161,8 +1189,8 @@ static void player_hits(void)
                 spawn_parts(e->x, e->y, 16, RGB(110, 10, 16), 1.6f);
                 add_blood(e->x, e->y, 7);
             } else {
-                if ((!EK[e->kind].poise || P.atk == 1) && e->state != ES_STRIKE) {
-                    e->state = ES_STAG; e->timer = P.atk ? 22 : 14;
+                if ((!EK[e->kind].poise || P.atk == AT_HEAVY || P.atk == AT_L3) && e->state != ES_STRIKE) {
+                    e->state = ES_STAG; e->timer = (P.atk == AT_HEAVY || P.atk == AT_L3) ? 22 : 14;
                 } else if (e->state == ES_IDLE) e->state = ES_CHASE;
             }
         }
@@ -1174,6 +1202,7 @@ static void player_hits(void)
             Bs.hp -= dmg;
             Bs.flash = 6;
             spawn_parts(Bs.x - dx / d * 14, Bs.y - dy / d * 14, 10, RGB(255, 150, 60), 2.4f);
+            spawn_hitfx(Bs.x - dx / d * 14, Bs.y - dy / d * 14, 18.0f);
             add_blood(Bs.x - dx / d * 12, Bs.y - dy / d * 12, 3 + frnd() * 3);
             if (Bs.hp <= 0) {
                 Bs.hp = 0; Bs.state = BS_DEAD; Bs.dead = 1; Bs.timer = 150;
@@ -1233,32 +1262,54 @@ static int near_brazier(void)
     return -1;
 }
 
+static void start_attack(int type, float mx, float my, float ml)
+{
+    P.state = PS_ATK; P.timer = 0; P.atk = type; P.charge = 0;
+    P.atkId++; P.hitDone = 0;
+    Bs.hitDone = 0;
+    if (ml > 0 && P.lock < 0) { P.fx = mx / ml; P.fy = my / ml; }
+    P.st -= ACOST[type]; P.stDelay = 30;
+    if (type != AT_HEAVY) sfx(SFX_SWING);
+}
+
 static void start_action(unsigned b, float mx, float my, float ml)
 {
     if ((b & B_CROSS) && P.st > 0) {
         P.state = PS_ROLL; P.timer = 0;
+        P.backstep = ml <= 0;
         if (ml > 0) { P.rx = mx / ml; P.ry = my / ml; } else { P.rx = -P.fx; P.ry = -P.fy; }
-        P.st -= 20; P.stDelay = 28; P.iframes = 14;
+        P.st -= P.backstep ? 12 : 20; P.stDelay = 28;
         sfx(SFX_ROLL);
-    } else if ((b & (B_SQUARE | B_TRIANGLE)) && P.st > 0) {
-        P.state = PS_ATK; P.timer = 0;
-        P.atk = (b & B_SQUARE) ? 0 : 1;
-        P.atkId++; P.hitDone = 0;
-        Bs.hitDone = 0;
-        if (ml > 0 && P.lock < 0) { P.fx = mx / ml; P.fy = my / ml; }
-        P.st -= P.atk ? 32 : 16; P.stDelay = 30;
-        sfx(SFX_SWING);
+    } else if ((b & B_SQUARE) && P.st > 0) {
+        start_attack(P.sprint ? AT_RUN : AT_L1, mx, my, ml);
+        P.combo = 0;
+    } else if ((b & B_TRIANGLE) && P.st > 0) {
+        start_attack(AT_HEAVY, mx, my, ml);
     } else if ((b & B_CIRCLE) && P.flasks > 0 && P.hp < maxhp()) {
         P.state = PS_HEAL; P.timer = 0;
     } else return;
+    P.sprint = 0;
     if (P.st < 0) P.st = 0;
     P.buf = 0; P.bufT = 0;
+}
+
+/* gira il personaggio verso una direzione con una velocita' massima (niente scatti) */
+static void turn_towards(float tx, float ty, float rate)
+{
+    float a = atan2f(P.fy, P.fx), b = atan2f(ty, tx), d = b - a;
+    while (d > PI) d -= 2 * PI;
+    while (d < -PI) d += 2 * PI;
+    if (d > rate) d = rate;
+    if (d < -rate) d = -rate;
+    a += d;
+    P.fx = cosf(a); P.fy = sinf(a);
 }
 
 static void player_update(const Input *in)
 {
     float mx = in->ax, my = in->ay, ml, lx, ly;
-    unsigned act = in->pressed & (B_SQUARE | B_TRIANGLE | B_CROSS | B_CIRCLE);
+    unsigned act = in->pressed & (B_SQUARE | B_TRIANGLE | B_CIRCLE);
+    int locked;
 
     if (in->held & B_LEFT) mx = -1;
     if (in->held & B_RIGHT) mx = 1;
@@ -1268,50 +1319,114 @@ static void player_update(const Input *in)
     if (ml < 0.25f) { mx = my = 0; ml = 0; }
     else if (ml > 1) { mx /= ml; my /= ml; ml = 1; }
 
+    /* X: tocco breve = schivata (al rilascio), tenuto premuto = corsa */
+    if (in->held & B_CROSS) {
+        P.crossT++;
+        if (P.crossT > 9 && ml > 0 && P.st > 1 && P.state == PS_FREE) P.sprint = 1;
+    } else {
+        if (P.crossT > 0 && P.crossT <= 9) act |= B_CROSS;
+        P.crossT = 0;
+        P.sprint = 0;
+    }
+    if (ml <= 0 || P.st <= 0) P.sprint = 0;
+
     /* buffer degli input: un tasto premuto poco prima viene eseguito appena possibile */
-    if (act) { P.buf = act; P.bufT = 10; }
+    if (act) { P.buf = act; P.bufT = 12; }
     else if (P.bufT > 0 && --P.bufT == 0) P.buf = 0;
 
     if (in->pressed & B_R) P.lock = (P.lock == -1) ? find_lock_target() : -1;
     if (P.lock != -1 && !lock_pos(&lx, &ly)) P.lock = -1;
+    locked = P.lock != -1 && lock_pos(&lx, &ly);
 
     if (P.iframes > 0) P.iframes--;
-    if (P.state == PS_FREE || P.state == PS_HEAL) {
+    if ((P.state == PS_FREE || P.state == PS_HEAL) && !P.sprint) {
         if (P.stDelay > 0) P.stDelay--;
-        else { P.st += 1.2f; if (P.st > maxst()) P.st = (float)maxst(); }
+        else { P.st += P.state == PS_FREE && ml <= 0 ? 1.6f : 1.2f; if (P.st > maxst()) P.st = (float)maxst(); }
     }
+    if (P.sprint) { P.st -= 0.45f; P.stDelay = 20; }
     if (P.hpGhost > P.hp) P.hpGhost -= 0.6f; else P.hpGhost = P.hp;
 
-    if (P.lock != -1 && lock_pos(&lx, &ly) && P.state != PS_ROLL) {
+    /* con l'aggancio guarda sempre il bersaglio (tranne durante la schivata e il colpo gia' partito) */
+    if (locked && P.state != PS_ROLL && !P.sprint) {
         float dx = lx - P.x, dy = ly - P.y, d = sqrtf(dx * dx + dy * dy) + 0.001f;
-        if (P.state != PS_ATK || P.timer < AW[P.atk]) { P.fx = dx / d; P.fy = dy / d; }
+        if (P.state != PS_ATK || P.timer < AW[P.atk]) turn_towards(dx / d, dy / d, 0.4f);
     }
 
     switch (P.state) {
-    case PS_FREE:
-        if (ml > 0) {
-            move_circle(&P.x, &P.y, 6, mx * 1.75f * ml, my * 1.75f * ml);
-            P.walk += 0.3f * ml;
-            if (P.lock == -1) { P.fx = mx / ml; P.fy = my / ml; }
+    case PS_FREE: {
+        /* movimento con accelerazione e frenata morbide */
+        float sp = P.sprint ? 2.8f : 1.8f, k = ml > 0 ? 0.28f : 0.22f;
+        float tvx = mx * sp * ml, tvy = my * sp * ml;
+        P.vx += (tvx - P.vx) * k; P.vy += (tvy - P.vy) * k;
+        if (fabsf(P.vx) + fabsf(P.vy) > 0.02f) {
+            move_circle(&P.x, &P.y, 6, P.vx, P.vy);
+            P.walk += sqrtf(P.vx * P.vx + P.vy * P.vy) * 0.17f;
         }
+        if (ml > 0 && (!locked || P.sprint)) turn_towards(mx, my, P.sprint ? 0.22f : 0.3f);
+        if (P.sprint && frame % 6 == 0) spawn_parts(P.x - P.fx * 4, P.y - P.fy * 4, 2, RGB(120, 112, 104), 0.5f);
         if (P.buf) start_action(P.buf, mx, my, ml);
         break;
+    }
     case PS_ATK: {
         int W = AW[P.atk], A = AA[P.atk], R = AR[P.atk];
-        P.timer++;
-        if (P.timer > W && P.timer <= W + A) {
-            move_circle(&P.x, &P.y, 6, P.fx * 1.3f, P.fy * 1.3f);
-            player_hits();
+        float stepk;
+        P.vx *= 0.7f; P.vy *= 0.7f;
+        /* attacco pesante caricabile: tieni premuto Triangolo */
+        if (P.atk == AT_HEAVY && (in->held & B_TRIANGLE) && P.timer == W - 3 && P.charge < 30) {
+            P.charge += 1;
+            if ((int)P.charge % 6 == 0) spawn_parts(P.x + P.fx * 6, P.y + P.fy * 6, 3, RGB(255, 170, 80), 0.6f);
+            break;
         }
-        if (P.timer >= W + A + R - 7 && P.buf) { P.state = PS_FREE; start_action(P.buf, mx, my, ml); }
+        if (P.atk == AT_HEAVY && P.timer == W - 2) sfx(SFX_SWING);
+        P.timer++;
+        /* nei primi frame si puo' ancora correggere la direzione */
+        if (P.timer < W && ml > 0 && !locked) turn_towards(mx, my, 0.12f);
+        /* avanzamento: spinta in avanti che cresce nella carica e si esaurisce nel colpo */
+        if (P.timer > W - 3 && P.timer <= W + A) {
+            stepk = 1.0f - (float)(P.timer - (W - 3)) / (A + 3);
+            move_circle(&P.x, &P.y, 6, P.fx * ASTEP[P.atk] * (0.4f + stepk), P.fy * ASTEP[P.atk] * (0.4f + stepk));
+        }
+        if (P.timer > W && P.timer <= W + A) player_hits();
+        if (P.timer == W + A && (P.atk == AT_HEAVY || P.atk == AT_L3 || P.atk == AT_RUN)) shake = 5;
+        if (P.atk == AT_HEAVY && P.timer == W + A - 2) {
+            /* la lama colpisce il terreno: onda d'urto, polvere e scintille */
+            shockX = P.x + P.fx * 20; shockY = P.y + P.fy * 20; shockT = 16;
+            shake = 9 + (int)(P.charge / 5);
+            spawn_parts(shockX, shockY, 14, RGB(170, 160, 150), 2.6f);
+            spawn_parts(shockX, shockY, 8, RGB(255, 170, 90), 3.2f);
+            spawn_hitfx(shockX, shockY, 2.0f);
+        }
+        /* finestra di combo: Quadrato durante il recupero concatena il colpo successivo */
+        if (P.timer >= W + A + 2 && (P.buf & B_SQUARE) && P.st > 0 && (P.atk == AT_L1 || P.atk == AT_L2 || P.atk == AT_RUN)) {
+            int next = P.atk == AT_L1 ? AT_L2 : (P.atk == AT_L2 ? AT_L3 : AT_L2);
+            P.buf = 0; P.bufT = 0;
+            start_attack(next, mx, my, ml);
+            if (P.st < 0) P.st = 0;
+            break;
+        }
+        /* la schivata puo' interrompere il recupero */
+        if (P.timer >= W + A + 3 && (P.buf & B_CROSS)) { P.state = PS_FREE; start_action(B_CROSS, mx, my, ml); break; }
+        if (P.timer >= W + A + R - 6 && P.buf) { P.state = PS_FREE; start_action(P.buf, mx, my, ml); }
         else if (P.timer >= W + A + R) P.state = PS_FREE;
         break;
     }
     case PS_ROLL: {
-        float s = P.timer < 12 ? 3.4f : 1.0f;
+        /* capriola: veloce all'inizio, rallenta morbidamente; invulnerabile dal 2o al 14o frame.
+         * Senza direzione: saltello all'indietro, piu' breve */
+        int dur = P.backstep ? 13 : 22;
+        float t = (float)P.timer / dur, s;
+        s = P.backstep ? 3.4f * (1 - t) : (t < 0.7f ? 4.0f * (1 - t * 0.8f) : 1.2f * (1 - t) * 3);
         P.timer++;
+        if (P.timer == 2) P.iframes = P.backstep ? 7 : 13;
         move_circle(&P.x, &P.y, 6, P.rx * s, P.ry * s);
-        if (P.timer >= 20) {
+        if (P.timer == 3 || P.timer == 12) spawn_parts(P.x, P.y, 3, RGB(120, 112, 104), 0.6f);
+        P.vx = P.rx * 0.8f; P.vy = P.ry * 0.8f;
+        if (P.timer >= dur - 4 && P.buf && !(P.buf & B_CROSS)) {
+            unsigned bb = P.buf;
+            P.state = PS_FREE;
+            if (bb & B_SQUARE) { start_attack(AT_RUN, mx, my, ml); P.buf = 0; P.bufT = 0; }   /* attacco dopo la capriola */
+            else start_action(bb, mx, my, ml);
+        } else if (P.timer >= dur) {
             P.state = PS_FREE;
             if (P.buf) start_action(P.buf, mx, my, ml);
         }
@@ -1334,7 +1449,8 @@ static void player_update(const Input *in)
         P.timer++;
         move_circle(&P.x, &P.y, 6, P.kx, P.ky);
         P.kx *= 0.8f; P.ky *= 0.8f;
-        if (P.timer >= 16) P.state = PS_FREE;
+        if (P.timer >= 8 && (P.buf & B_CROSS)) { P.state = PS_FREE; start_action(B_CROSS, mx, my, ml); }   /* rialzarsi rotolando */
+        else if (P.timer >= 16) P.state = PS_FREE;
         break;
     default: break;
     }
@@ -1416,6 +1532,9 @@ static void player_update(const Input *in)
 /* ------------------------------------------------------------------ */
 static void enemies_update(void)
 {
+#ifdef GAME_DEBUG
+    if (dbg_noen) return;
+#endif
     int i, j;
     for (i = 0; i < NE; i++) {
         Enemy *e = &E[i];
@@ -1674,6 +1793,7 @@ static void rb_player_hits(float range, int dmg)
             b->hitDone = P.atkId;
             b->hp -= dmg; b->flash = 6;
             spawn_parts(b->x - dx / d * RBD[i].body, b->y - dy / d * RBD[i].body, 10, RGB(255, 170, 90), 2.2f);
+            spawn_hitfx(b->x - dx / d * RBD[i].body, b->y - dy / d * RBD[i].body, 18.0f);
             sfx(SFX_HIT);
             if (b->hp <= 0) { b->hp = 0; rb_defeat(i); }
         }
@@ -2098,10 +2218,14 @@ void game_update(const Input *in)
         if (parts[i].life > 0) {
             parts[i].x += parts[i].vx; parts[i].y += parts[i].vy;
             parts[i].vx *= 0.9f; parts[i].vy *= 0.9f;
+            parts[i].h += parts[i].vh; parts[i].vh -= 0.16f;
+            if (parts[i].h < 0.3f) { parts[i].h = 0.3f; parts[i].vh = -parts[i].vh * 0.25f; parts[i].vx *= 0.5f; parts[i].vy *= 0.5f; }
             parts[i].life--;
         }
 
     for (i = 0; i < MAXBLOOD; i++) if (blood[i].life > 0) blood[i].life--;
+    for (i = 0; i < 6; i++) if (hfx[i].t > 0) hfx[i].t--;
+    if (shockT > 0) shockT--;
     camX += (P.x - camX) * 0.18f;
     camZ += (P.y - camZ) * 0.18f;
     music_mode = (mode == M_TITLE || mode == M_STORY) ? 0 : (mode == M_END ? 3 :
@@ -2173,10 +2297,13 @@ void game_update(const Input *in)
             wi.ax = fx * (-sy) + (-fz) * sx;
             wi.ay = fz * (-sy) + fx * sx;
             wi.held &= ~(unsigned)(B_UP | B_DOWN | B_LEFT | B_RIGHT);
-            player_update(&wi);
+            if (hitstop > 0) wi.pressed = wi.pressed & (B_SQUARE | B_TRIANGLE | B_CIRCLE);
+            if (hitstop <= 0) player_update(&wi);
+            else if (wi.pressed & (B_SQUARE | B_TRIANGLE)) { P.buf = wi.pressed & (B_SQUARE | B_TRIANGLE); P.bufT = 12; }
         }
         keep_centered();
         if (mode != M_PLAY) break;
+        if (hitstop > 0) { hitstop--; break; }
         enemies_update();
         boss_update();
         rb_update();
@@ -2220,7 +2347,7 @@ void game_update(const Input *in)
 #define CAM_PITCH 0.96f
 #define FOGC RGB(26, 30, 42)
 
-enum { TX_WHITE, TX_COBBLE, TX_STONE, TX_WOOD, TX_SLATE, TX_CLOTH, TX_METAL, TX_BARK, TX_GLOW, TX_WINDOW, TX_BRICK, TX_PLASTER, TX_FLAG, TX_GRASS, TX_DIRT, TX_ROCK, NTEX };
+enum { TX_WHITE, TX_COBBLE, TX_STONE, TX_WOOD, TX_SLATE, TX_CLOTH, TX_METAL, TX_BARK, TX_GLOW, TX_WINDOW, TX_BRICK, TX_PLASTER, TX_FLAG, TX_GRASS, TX_DIRT, TX_ROCK, TX_FIRE, NTEX };
 #define TSZ 64
 
 static V3 v3(float x, float y, float z) { V3 v; v.x = x; v.y = y; v.z = z; return v; }
@@ -2449,6 +2576,19 @@ static void gen_textures(void)
                     else if (x % 8 == 0 || y % 9 == 0) { r *= 0.55f; g *= 0.55f; bl *= 0.55f; }
                     break;
                 }
+                case TX_FIRE: {
+                    /* lingue di fuoco: strisce allungate nel verso del movimento, piu' dense verso il filo */
+                    float v = y / (float)(TSZ - 1), n, edge, in, core;
+                    n = 0.6f * vnoise2(x * 3 / (float)TSZ, y * 9 / (float)TSZ, 3, 9, 71) + 0.4f * vnoise2(x * 7 / (float)TSZ, y * 18 / (float)TSZ, 7, 18, 73);
+                    edge = v + (n - 0.5f) * 0.55f;
+                    in = (v < 0.3f ? v / 0.3f : 1) * (edge > 0.7f ? (edge > 1.0f ? 0 : (1.0f - edge) / 0.3f) : 1);
+                    in *= 0.55f + 0.6f * n;
+                    if (in > 1) in = 1;
+                    if (in < 0) in = 0;
+                    core = in * in;
+                    r = 1; g = 0.55f + 0.45f * core; bl = 0.2f + 0.7f * core * core; a = in;
+                    break;
+                }
                 default:
                     r = g = bl = 1;
                 }
@@ -2622,6 +2762,7 @@ static void fan(float x, float z, float y, float r0, float r1, float a0, float a
 }
 
 /* alone luminoso rivolto alla telecamera (additivo) */
+static void splat(float x, float y, float z, float s, uint32_t col);
 static void glow(float x, float y, float z, float s, uint32_t col)
 {
     V3 p0;
@@ -2632,6 +2773,16 @@ static void glow(float x, float y, float z, float s, uint32_t col)
     p2 = v3(x + camR.x * s + camU.x * s, y + camR.y * s + camU.y * s, z + camR.z * s + camU.z * s);
     p3 = v3(x - camR.x * s + camU.x * s, y - camR.y * s + camU.y * s, z - camR.z * s + camU.z * s);
     emit_quad(p0, p1, p2, p3, col, col, col, col, 0, 0, 1, 0, 1, 1, 0, 1, TX_GLOW, RB_ADD);
+}
+static void splat(float x, float y, float z, float s, uint32_t col)
+{
+    V3 p0, p1, p2, p3;
+    y += cur_gy;
+    p0 = v3(x - camR.x * s - camU.x * s, y - camR.y * s - camU.y * s, z - camR.z * s - camU.z * s);
+    p1 = v3(x + camR.x * s - camU.x * s, y + camR.y * s - camU.y * s, z + camR.z * s - camU.z * s);
+    p2 = v3(x + camR.x * s + camU.x * s, y + camR.y * s + camU.y * s, z + camR.z * s + camU.z * s);
+    p3 = v3(x - camR.x * s + camU.x * s, y - camR.y * s + camU.y * s, z - camR.z * s + camU.z * s);
+    emit_quad(p0, p1, p2, p3, col, col, col, col, 0, 0, 1, 0, 1, 1, 0, 1, TX_GLOW, RB_ALPHA);
 }
 
 /* macchia morbida a terra: luce (additiva) o ombra (alpha) */
@@ -2694,8 +2845,26 @@ static float pb_x, pb_z, pb_c, pb_s, pb_roll, pb_y;
 static float mvAmt, lastWalk;
 static int pb_rolling;
 
+/* colonna vertebrale del personaggio: torsione del busto, peso spostato sui fianchi, spalle inclinate.
+ * i piedi restano fermi a terra, il busto ruota, la testa compensa e resta piu' stabile */
+static int pb_body;
+static float pb_tw, pb_sway, pb_tilt, pb_bank, pb_hipU = 11, pb_shU = 17.4f, pb_wover = -9;
+static void body_bend(float *lf, float lu, float *ls)
+{
+    float w, off, a, ca, sa, f0 = *lf, s0 = *ls;
+    if (pb_wover > -5) { w = pb_wover; off = 1; }
+    else if (lu < pb_hipU) { off = lu > 0 ? lu / pb_hipU : 0; w = -0.35f * off; }
+    else if (lu < pb_shU) { float t = (lu - pb_hipU) / (pb_shU - pb_hipU); w = -0.35f + 1.35f * t; off = 1; }
+    else { float t = (lu - pb_shU) / 2.5f; if (t > 1) t = 1; w = 1 - 0.6f * t; off = 1; }
+    a = pb_tw * w;
+    ca = 1 - a * a * 0.5f; sa = a - a * a * a * (1.0f / 6);
+    *lf = f0 * ca - s0 * sa;
+    *ls = f0 * sa + s0 * ca + pb_sway * off + (lu > pb_hipU ? pb_tilt * (lu - pb_hipU) : 0) + pb_bank * lu;
+}
+
 static V3 L2W(float lf, float lu, float ls)
 {
+    if (pb_body) body_bend(&lf, lu, &ls);
     if (pb_rolling) {
         float df = lf, du = lu - 5.5f, ca = cosf(pb_roll), sa = sinf(pb_roll);
         du *= 0.75f;
@@ -2709,6 +2878,7 @@ static V3 L2W(float lf, float lu, float ls)
 static float limb_taper = 1.0f;
 static int mat_metal;      /* 1 = piastre d'acciaio con riflessi */
 static int hi_detail;      /* 1 = piu' poligoni (personaggio) */
+static int lo_detail;      /* 1 = meno poligoni (nemici lontani) */
 
 static float soft_shade(float nx, float ny, float nz)
 {
@@ -2716,6 +2886,23 @@ static float soft_shade(float nx, float ny, float nz)
     float rim = 1.0f - fabsf(nx * camR.z - nz * camR.x) ;
     (void)rim;
     return 0.4f + 0.55f * (dl > 0 ? dl : 0) + 0.12f * (ny > 0 ? ny : 0) + 0.06f;
+}
+
+/* luce di contorno fredda (stile moderno): i bordi in controluce si accendono di blu lunare */
+static int rim_on;
+static uint32_t rim_add(uint32_t c, float nx, float ny, float nz, V3 p)
+{
+    float vx, vy, vz, vl, rim;
+    int r, g, b;
+    if (!rim_on) return c;
+    vx = camEye.x - p.x; vy = camEye.y - p.y; vz = camEye.z - p.z; vl = sqrtf(vx * vx + vy * vy + vz * vz) + 0.001f;
+    rim = 1 - fabsf((nx * vx + ny * vy + nz * vz) / vl);
+    rim = rim * rim * rim;
+    r = (int)(c & 255) + (int)(rim * 55); g = (int)((c >> 8) & 255) + (int)(rim * 75); b = (int)((c >> 16) & 255) + (int)(rim * 120);
+    if (r > 255) r = 255;
+    if (g > 255) g = 255;
+    if (b > 255) b = 255;
+    return (c & 0xFF000000u) | ((uint32_t)b << 16) | ((uint32_t)g << 8) | (uint32_t)r;
 }
 
 /* colore di una superficie metallica: diffusa scura + riflesso speculare verso la telecamera */
@@ -2732,6 +2919,7 @@ static uint32_t metal_col(uint32_t col, float nx, float ny, float nz, V3 p)
     c = lit(col, 0.28f + 0.5f * (dl > 0 ? dl : 0) + 0.18f * rim * rim);
     add = (int)(sp * 190);
     r = (int)(c & 255) + (int)(add * cur_lt.r); g = (int)((c >> 8) & 255) + (int)(add * cur_lt.g); b = (int)((c >> 16) & 255) + (int)(add * cur_lt.b);
+    if (rim_on) { float r3 = rim * rim * rim; r += (int)(r3 * 60); g += (int)(r3 * 85); b += (int)(r3 * 135); }
     if (r > 255) r = 255;
     if (g > 255) g = 255;
     if (b > 255) b = 255;
@@ -2754,7 +2942,7 @@ static void limb(V3 a, V3 b, float w, float d, uint32_t col)
 {
     float ax = b.x - a.x, ay = b.y - a.y, az = b.z - a.z, len = sqrtf(ax * ax + ay * ay + az * az) + 0.0001f;
     float rx = -pb_s, rz = pb_c, dp, sx, sy, sz, sl, fx, fy, fz, tp = limb_taper;
-    int seg = hi_detail ? ((w + d > 1.5f) ? 14 : 10) : ((w + d > 1.5f) ? 10 : 7), k, tex = cur_tex;
+    int seg = lo_detail ? 5 : (w + d > 1.5f) ? (hi_detail ? 12 : 9) : ((w + d > 0.6f) ? (hi_detail ? 9 : 7) : (hi_detail ? 5 : 4)), k, tex = cur_tex;
     float ts = cur_ts, vlen = ts > 0 ? len / ts : 1;
     V3 ra[15], rb[15];
     uint32_t ca[15], cb[15];
@@ -2775,7 +2963,7 @@ static void limb(V3 a, V3 b, float w, float d, uint32_t col)
         ra[k] = v3(a.x + ox, a.y + oy, a.z + oz);
         rb[k] = v3(b.x + ox * tp, b.y + oy * tp, b.z + oz * tp);
         if (mat_metal) { ca[k] = metal_col(col, nx, ny, nz, ra[k]); cb[k] = metal_col(col, nx, ny, nz, rb[k]); }
-        else { ca[k] = lit(col, sh * 0.9f); cb[k] = lit(col, sh); }
+        else { ca[k] = rim_add(lit(col, sh * 0.9f), nx, ny, nz, ra[k]); cb[k] = rim_add(lit(col, sh), nx, ny, nz, rb[k]); }
     }
     for (k = 0; k < seg; k++) {
         float u0 = (float)k / seg, u1 = (float)(k + 1) / seg;
@@ -2794,48 +2982,51 @@ static void limb(V3 a, V3 b, float w, float d, uint32_t col)
 /* ellissoide in coordinate del corpo (testa, mani, articolazioni) */
 static void blobL(float cf, float cu, float cs, float rf, float ru, float rs, uint32_t col, int rings, int segs)
 {
+    /* griglia di vertici calcolata una volta sola (prima: 4 volte per quadrato) */
+    V3 pos[17][21];
+    uint32_t cc[17][21];
+    float ctab[21], stab[21];
     int r, k, tex = cur_tex;
-    if (hi_detail) { rings = rings * 3 / 2; segs = segs * 3 / 2; }
-    for (r = 0; r < rings; r++) {
-        float t0 = PI * r / rings, t1 = PI * (r + 1) / rings;
-        for (k = 0; k < segs; k++) {
-            float p0 = 2 * PI * k / segs, p1 = 2 * PI * (k + 1) / segs;
-            float th[4] = { t0, t0, t1, t1 }, ph[4] = { p0, p1, p1, p0 };
-            V3 pos[4];
-            uint32_t cc[4];
-            int q;
-            for (q = 0; q < 4; q++) {
-                float st = sinf(th[q]), ct = cosf(th[q]), cp = cosf(ph[q]), sp = sinf(ph[q]);
-                float lf = st * cp, lu = ct, ls = st * sp;
-                float nf = lf / rf, nu = lu / ru, ns = ls / rs, nl = sqrtf(nf * nf + nu * nu + ns * ns) + 0.0001f;
-                float wx, wz;
-                nf /= nl; nu /= nl; ns /= nl;
-                wx = pb_c * nf - pb_s * ns; wz = pb_s * nf + pb_c * ns;
-                pos[q] = L2W(cf + lf * rf, cu + lu * ru, cs + ls * rs);
-                cc[q] = mat_metal ? metal_col(col, wx, nu, wz, pos[q]) : lit(col, soft_shade(wx, nu, wz));
-            }
-            tri_v(pos[0], cc[0], (float)k / segs, (float)r / rings, pos[1], cc[1], (float)(k + 1) / segs, (float)r / rings,
-                  pos[2], cc[2], (float)(k + 1) / segs, (float)(r + 1) / rings, tex);
-            tri_v(pos[0], cc[0], (float)k / segs, (float)r / rings, pos[2], cc[2], (float)(k + 1) / segs, (float)(r + 1) / rings,
-                  pos[3], cc[3], (float)k / segs, (float)(r + 1) / rings, tex);
+    if (hi_detail) { rings = rings * 5 / 4; segs = segs * 5 / 4; }
+    if (lo_detail) { rings = rings > 4 ? rings / 2 + 1 : 3; segs = segs > 7 ? segs / 2 + 1 : 5; }
+    if (rings > 16) rings = 16;
+    if (segs > 20) segs = 20;
+    for (k = 0; k <= segs; k++) { float p = 2 * PI * k / segs; ctab[k] = cosf(p); stab[k] = sinf(p); }
+    for (r = 0; r <= rings; r++) {
+        float th = PI * r / rings, st = sinf(th), ct = cosf(th);
+        for (k = 0; k <= segs; k++) {
+            float lf = st * ctab[k], lu = ct, ls = st * stab[k];
+            float nf = lf / rf, nu = lu / ru, ns = ls / rs, nl = sqrtf(nf * nf + nu * nu + ns * ns) + 0.0001f;
+            float wx, wz;
+            nf /= nl; nu /= nl; ns /= nl;
+            wx = pb_c * nf - pb_s * ns; wz = pb_s * nf + pb_c * ns;
+            pos[r][k] = L2W(cf + lf * rf, cu + lu * ru, cs + ls * rs);
+            cc[r][k] = mat_metal ? metal_col(col, wx, nu, wz, pos[r][k]) : rim_add(lit(col, soft_shade(wx, nu, wz)), wx, nu, wz, pos[r][k]);
         }
     }
+    for (r = 0; r < rings; r++)
+        for (k = 0; k < segs; k++) {
+            float u0 = (float)k / segs, u1 = (float)(k + 1) / segs, v0 = (float)r / rings, v1 = (float)(r + 1) / rings;
+            tri_v(pos[r][k], cc[r][k], u0, v0, pos[r][k + 1], cc[r][k + 1], u1, v0, pos[r + 1][k + 1], cc[r + 1][k + 1], u1, v1, tex);
+            tri_v(pos[r][k], cc[r][k], u0, v0, pos[r + 1][k + 1], cc[r + 1][k + 1], u1, v1, pos[r + 1][k], cc[r + 1][k], u0, v1, tex);
+        }
 }
 
 /* telo del mantello: griglia di vertici che ondeggia */
 static void cloth_cape(float shU, float lean, float sway, uint32_t col)
 {
-    enum { CW = 7, CH = 4 };
+    enum { CW = 9, CH = 6 };
     V3 pt[CH + 1][CW + 1];
     float nrm[CH + 1][CW + 1][3];
     int i, j, tex = cur_tex;
     for (i = 0; i <= CH; i++)
         for (j = 0; j <= CW; j++) {
             float t = (float)i / CH, sj = ((float)j / CW) * 2 - 1;
-            float half = 2.6f + t * 0.9f;
-            float back = 1.3f + t * (0.7f + mvAmt * 2.4f) + sinf(frame * 0.07f + j * 0.9f + i) * 0.25f * t + sway * 0.5f * t;
+            float half = 1.7f + t * 1.4f;
+            float back = 1.3f + t * (0.7f + mvAmt * 2.6f + (P.sprint ? 2.5f : 0)) + sinf(frame * 0.07f + j * 0.9f + i) * 0.3f * t + sway * 0.5f * t;
             float lf = lean * 0.8f - back + 1.0f * sj * sj * (1 - 0.4f * t);
-            float lu = shU + 0.9f - t * (shU - 6.5f) + (sj * sj) * 0.6f * (1 - t);
+            float lu = shU - 0.3f - t * (shU - 4.5f) + (sj * sj) * 0.4f * (1 - t);
+            if (i == CH) lu += (float)((hash2(j, 77) % 4)) * 0.6f;          /* orlo sfrangiato */
             pt[i][j] = L2W(lf, lu, sj * half);
         }
     for (i = 0; i <= CH; i++)
@@ -2855,7 +3046,7 @@ static void cloth_cape(float shU, float lean, float sway, uint32_t col)
                 float *n = nrm[ii[q]][jj[q]];
                 float sh = soft_shade(fabsf(n[0]), fabsf(n[1]), fabsf(n[2]));
                 if (ii[q] == CH) sh *= 0.85f;
-                c[q] = lit(col, sh);
+                c[q] = rim_add(lit(col, sh), n[0], n[1], n[2], pt[ii[q]][jj[q]]);
             }
             tri_v(pt[i][j], c[0], (float)j / 3, (float)i / 3, pt[i][j + 1], c[1], (float)(j + 1) / 3, (float)i / 3,
                   pt[i + 1][j + 1], c[2], (float)(j + 1) / 3, (float)(i + 1) / 3, tex);
@@ -3412,23 +3603,81 @@ static void draw_brazier(int i)
 /* --- il pellegrino: figura umana articolata (design originale) --- */
 /* trasformazione locale del corpo: f = avanti, u = alto, s = destra */
 
+/* ---- traiettorie dei colpi: la mano corre lungo un arco attorno al busto e la lama punta verso l'esterno,
+ * cosi' la punta disegna grandi archi (fendente diagonale, rovescio, rotazione, colpo dall'alto) ---- */
+static float ease_in_out(float t) { return t * t * (3 - 2 * t); }
+static float ease_out3(float t) { return 1 - (1 - t) * (1 - t) * (1 - t); }
+static void arc_pose(int atk, float tm, float sf, float su, float *h, float *d)
+{
+    int W = AW[atk], A = AA[atk];
+    float tw = tm < W ? tm / W : 1.0f, ta = tm <= W ? 0 : (tm >= W + A ? 1 : (tm - W) / A);
+    float th, ax, ay, az, bx = 1, by = 0, bz = 0, rh = 5.2f, cf = sf + 0.9f, cu = su - 1.6f, cs = 0.7f;
+    float rc, rsn, rx, ry, rz, rec = tm > W + A ? (tm - W - A) / AR[atk] : 0;
+    if (tw < 0) tw = 0;
+    tw = ease_in_out(tw); ta = ease_out3(ta);
+    if (rec > 1) rec = 1;
+    switch (atk) {
+    case AT_L1:     /* fendente diagonale: da sopra la spalla destra fino in basso a sinistra */
+        ax = 0; ay = 0.72f; az = 0.69f;
+        th = 0.5f - 1.15f * tw + 3.95f * ta - 0.25f * rec;
+        break;
+    case AT_L2:     /* rovescio ascendente: dal basso a sinistra verso l'alto a destra */
+        ax = 0; ay = 0.38f; az = 0.92f;
+        th = 3.1f + 0.45f * tw - 3.85f * ta + 0.2f * rec;
+        break;
+    case AT_L3:     /* rotazione completa: la lama resta di lato e il corpo gira su se' stesso */
+        ax = 0; ay = 0.12f; az = 0.99f;
+        th = 1.1f - 1.0f * tw + 1.0f * ta;
+        cu = su - 3.0f;
+        break;
+    case AT_HEAVY:  /* colpo dall'alto a due mani: lama dietro la testa, poi giu' fino a terra */
+        ax = 0; ay = 1; az = 0.08f;
+        th = 0.6f - 1.55f * tw + 3.25f * ta;
+        if (P.charge > 0 && tm >= W - 3 && tm < W) th = -0.95f + sinf(frame * 0.6f) * 0.04f;
+        cs = 0.2f; rh = 5.6f;
+        break;
+    default:        /* in corsa: balzo e fendente diagonale ampio */
+        ax = 0; ay = 0.6f; az = 0.8f;
+        th = 0.2f - 1.0f * tw + 4.1f * ta;
+        break;
+    }
+    rc = cosf(th); rsn = sinf(th);
+    rx = rc * ax + rsn * bx; ry = rc * ay + rsn * by; rz = rc * az + rsn * bz;
+    h[0] = cf + rx * rh; h[1] = cu + ry * rh; h[2] = cs + rz * rh;
+    /* la lama punta in fuori e un po' in avanti rispetto all'arco */
+    d[0] = rx + 0.25f; d[1] = ry; d[2] = rz;
+    if (atk == AT_HEAVY && ta > 0.7f) { d[1] -= 0.4f; }
+}
+/* rotazione del corpo nel colpo circolare */
+static float spin_angle(void)
+{
+    int W = AW[AT_L3], A = AA[AT_L3];
+    float ta;
+    if (P.state != PS_ATK || P.atk != AT_L3 || P.timer <= W) return 0;
+    ta = P.timer >= W + A ? 1 : (float)(P.timer - W) / A;
+    return -2 * PI * ease_out3(ta);
+}
+static V3 trB[18], trT[18];
 static void draw_player(void)
 {
     float x = P.x, z = P.y;
     float ang = atan2f(P.fy, P.fx);
-    uint32_t tunic = RGB(118, 114, 108), cape = RGB(78, 80, 84), capeD = RGB(58, 60, 64);
-    uint32_t steel = RGB(118, 122, 134), steelD = RGB(86, 88, 98), bronze = RGB(176, 138, 82), mail = RGB(96, 98, 106);
+    uint32_t tunic = RGB(118, 114, 108), cape = RGB(96, 30, 34), capeD = RGB(66, 20, 24);
+    uint32_t steel = RGB(146, 152, 166), steelD = RGB(100, 104, 118), bronze = RGB(176, 138, 82), mail = RGB(96, 98, 106);
     uint32_t leather = RGB(96, 70, 50), metalc = RGB(210, 214, 228), ember = RGB(200, 90, 40);
     float p = P.walk, breath = sinf(frame * 0.05f) * 0.15f, sway = sinf(frame * 0.045f + p * 0.5f);
-    float legA[2], kneeB[2], armA[2], lean = 0;
-    float hipU, shU = 16.6f;
+    float legA[2], kneeB[2], armA[2], lean = 0, legSide[2] = { 0, 0 };
+    float hipU, shU = 17.4f;
     float swF = 0, swU = 0, swS = 0;     /* direzione della lama (locale) */
     float hf, hu, hs;                    /* mano destra */
     int i, attacking = P.state == PS_ATK;
 
+#ifdef GAME_DEBUG
+    if (dbg_nopl) return;
+#endif
     if (P.state == PS_DEAD && mode == M_DEAD) return;
+    if (P.iframes > 0 && P.iframes < 5000 && P.state != PS_ROLL && (frame & 2)) return;
     hi_detail = 1;
-    if (P.iframes > 0 && P.state != PS_ROLL && (frame & 2)) return;
 
     /* quanto si sta muovendo (per l'ampiezza del passo) */
     {
@@ -3449,33 +3698,132 @@ static void draw_player(void)
     if (P.state == PS_ROLL) {
         float ra = atan2f(P.ry, P.rx);
         pb_c = cosf(ra); pb_s = sinf(ra);
-        pb_rolling = 1;
-        pb_roll = (P.timer / 18.0f) * 2 * PI;
-        if (pb_roll > 2 * PI) pb_roll = 2 * PI;
-        pb_y += -sinf(pb_roll * 0.5f) * 2.5f;
-    } else { pb_c = cosf(ang); pb_s = sinf(ang); }
+        if (P.backstep) {
+            /* saltello all'indietro: niente capriola, il corpo resta rivolto in avanti */
+            float t = P.timer / 13.0f;
+            pb_c = cosf(ang); pb_s = sinf(ang);
+            pb_y += sinf(t * PI) * 2.2f;
+        } else {
+            float t = (P.timer - 2) / 15.0f;
+            if (t < 0) t = 0;
+            if (t > 1) t = 1;
+            t = t * t * (3 - 2 * t);               /* rotazione morbida: lenta-veloce-lenta */
+            pb_rolling = 1;
+            pb_roll = t * 2 * PI;
+            pb_y += -sinf(t * PI) * 2.8f;
+        }
+    } else {
+        float sp = spin_angle();
+        pb_c = cosf(ang + sp); pb_s = sinf(ang + sp);
+        if (P.state == PS_ATK && (P.atk == AT_RUN || P.atk == AT_HEAVY)) {
+            /* balzo: il corpo si stacca da terra durante la carica e ricade nel colpo */
+            int W = AW[P.atk], A = AA[P.atk];
+            float t = (float)(P.timer - (W - 5)) / (A + 3);
+            if (t > 0 && t < 1) pb_y += sinf(t * PI) * (P.atk == AT_RUN ? 4.0f : 2.5f);
+        }
+    }
 
     /* ---- posa ---- */
-    for (i = 0; i < 2; i++) {
-        float ph = p + i * PI;
-        legA[i] = sinf(ph) * 0.62f * mvAmt;
-        kneeB[i] = (cosf(ph) > 0 ? cosf(ph) : 0) * 0.9f * mvAmt + 0.05f;
-        armA[i] = -sinf(ph) * 0.5f * mvAmt;
+    {
+        static float sLeg[2], sKnee[2], sArm[2], sLean, sHip, sSide[2];
+        float tLeg[2], tKnee[2], tArm[2], tLean = 0, tHip, tSide[2] = { 0, 0 }, k;
+        float amp = P.sprint ? 0.95f : 0.62f, side_amt = 0;
+        if (P.lock != -1 && P.state == PS_FREE && !P.sprint) {
+            /* passo laterale quando sei agganciato: le gambe si allargano di lato */
+            float vl = sqrtf(P.vx * P.vx + P.vy * P.vy) + 0.001f;
+            float fwd = (P.vx * P.fx + P.vy * P.fy) / vl, sd = (P.vx * -P.fy + P.vy * P.fx) / vl;
+            side_amt = sd * mvAmt;
+            amp *= 0.4f + 0.6f * fabsf(fwd);
+            if (fwd < -0.3f) amp = -amp;          /* indietreggia */
+        }
+        for (i = 0; i < 2; i++) {
+            float ph = p + i * PI, kc = 0.5f + 0.5f * cosf(ph - 0.35f);
+            /* ciclo del passo: il ginocchio si piega molto quando la gamba torna avanti (in corsa il tallone sale),
+             * resta quasi tesa nell'appoggio; la coscia oscilla di piu' davanti che dietro */
+            tLeg[i] = (sinf(ph) + (P.sprint ? 0.18f : 0.08f)) * amp * mvAmt;
+            tKnee[i] = (0.1f + kc * kc * (P.sprint ? 2.0f : 1.05f)) * mvAmt + 0.06f;
+            tArm[i] = -sinf(ph) * (P.sprint ? 0.95f : 0.45f) * mvAmt;
+            tSide[i] = sinf(ph) * side_amt * 0.9f;
+        }
+        /* rimbalzo: due volte per ciclo, piu' ampio e con fase di volo nello scatto */
+        tHip = 11.0f + (P.sprint ? fabsf(cosf(p)) * 1.1f - 0.4f : fabsf(sinf(p)) * 0.45f) * mvAmt + breath * 0.5f;
+        if (P.sprint) tLean = 1.25f;
+        else tLean = 0.35f * mvAmt;
+        if (attacking) {
+            int W = AW[P.atk];
+            float lunge = P.timer < W ? (float)P.timer / W : 1.0f;
+            int left = P.atk == AT_L2;
+            tLeg[left] = 0.55f * lunge; tKnee[left] = 0.45f * lunge; tLeg[1 - left] = -0.45f * lunge; tKnee[1 - left] = 0.3f;
+            tHip = 10.8f - 0.9f * lunge; tLean = 0.6f + 0.6f * lunge;
+            if (P.atk == AT_HEAVY && P.timer >= W - 3 && P.timer < W) { tHip = 9.2f; tLean = -0.3f; }   /* carica: busto indietro */
+            if (P.atk == AT_RUN || P.atk == AT_L3) tLean = 0.4f + 1.0f * lunge;
+        }
+        if (P.state == PS_HURT) { tLean = -1.2f; tHip = 9.6f; }
+        if (P.state == PS_ROLL && P.backstep) { tLean = -0.8f; tLeg[0] = 0.3f; tLeg[1] = -0.5f; tKnee[0] = tKnee[1] = 0.6f; }
+        if (P.state == PS_HEAL) tLean = 0.2f;
+        /* sfumatura: le pose si raggiungono in pochi frame invece di scattare */
+        k = (P.state == PS_ATK || P.state == PS_ROLL) ? 0.55f : (P.state == PS_FREE ? 0.5f : 0.3f);
+        for (i = 0; i < 2; i++) {
+            sLeg[i] += (tLeg[i] - sLeg[i]) * k; sKnee[i] += (tKnee[i] - sKnee[i]) * k;
+            sArm[i] += (tArm[i] - sArm[i]) * k; sSide[i] += (tSide[i] - sSide[i]) * k;
+            legA[i] = sLeg[i]; kneeB[i] = sKnee[i]; armA[i] = sArm[i];
+        }
+        sLean += (tLean - sLean) * k; sHip += (tHip - sHip) * k;
+        if (sHip < 5) sHip = tHip;
+        lean = sLean; hipU = sHip;
+        legSide[0] = sSide[0]; legSide[1] = sSide[1];
+        /* inerzia: ci si inclina in avanti quando si accelera, indietro quando si frena,
+         * e di lato verso l'interno della curva */
+        {
+            static float lastSp, lastAng, sAcc, sBank;
+            float sp = sqrtf(P.vx * P.vx + P.vy * P.vy), da = ang - lastAng;
+            if (da > PI) da -= 2 * PI;
+            if (da < -PI) da += 2 * PI;
+            if (P.state != PS_FREE) da = 0;
+            sAcc += ((sp - lastSp) * 1.6f - sAcc) * 0.15f;
+            sBank += (da * sp * 0.5f - sBank) * 0.15f;
+            if (sBank > 0.06f) sBank = 0.06f;
+            if (sBank < -0.06f) sBank = -0.06f;
+            lastSp = sp; lastAng = ang;
+            lean += sAcc > 1.2f ? 1.2f : (sAcc < -1.2f ? -1.2f : sAcc);
+            pb_bank = P.state == PS_ROLL ? 0 : sBank;
+        }
+        /* torsione del busto e spostamento del peso */
+        {
+            static float sTw, sSw, sTl;
+            float tTw, tSw, tTl, idle = 1 - mvAmt;
+            float tamp = P.sprint ? 0.22f : 0.15f;
+            tTw = sinf(p) * tamp * mvAmt + sinf(frame * 0.021f) * 0.05f * idle;
+            tSw = cosf(p) * 0.3f * mvAmt + sinf(frame * 0.013f) * 0.28f * idle;
+            tTl = -cosf(p) * 0.03f * mvAmt + sinf(frame * 0.013f) * 0.012f * idle;
+            if (attacking) {
+                int W = AW[P.atk], A = AA[P.atk];
+                float w1 = P.timer < W ? (float)P.timer / W : 1.0f;
+                float a1 = P.timer <= W ? 0 : (P.timer >= W + A ? 1 : (float)(P.timer - W) / A);
+                w1 = w1 * w1 * (3 - 2 * w1); a1 = 1 - (1 - a1) * (1 - a1);
+                if (P.atk == AT_L1) tTw = 0.55f * w1 - 1.0f * a1;
+                else if (P.atk == AT_L2) tTw = -0.55f * w1 + 1.0f * a1;
+                else if (P.atk == AT_L3) tTw = 0.35f * w1 - 0.35f * a1;
+                else if (P.atk == AT_HEAVY) tTw = 0.45f * w1 - 0.6f * a1;
+                else tTw = 0.3f * w1 - 0.5f * a1;
+                tSw = -0.4f * w1 + 0.6f * a1; tTl = 0.04f * w1 - 0.05f * a1;
+            }
+            if (P.state == PS_HURT) { tTw = 0.25f; tTl = -0.05f; }
+            if (P.state == PS_ROLL) tTw = tSw = tTl = 0;
+            sTw += (tTw - sTw) * (attacking ? 0.5f : 0.2f);
+            sSw += (tSw - sSw) * 0.2f; sTl += (tTl - sTl) * 0.2f;
+            pb_tw = sTw; pb_sway = sSw; pb_tilt = sTl;
+        }
     }
-    hipU = 10.4f + fabsf(sinf(p)) * 0.4f * mvAmt + breath * 0.5f;
-    if (attacking) {
-        legA[0] = 0.45f; kneeB[0] = 0.35f; legA[1] = -0.35f; kneeB[1] = 0.25f;
-        hipU = 9.8f; lean = 0.9f;
-    }
-    if (P.state == PS_HURT) lean = -1.0f;
     if (pb_rolling) { legA[0] = legA[1] = 1.2f; kneeB[0] = kneeB[1] = 2.0f; lean = 1.5f; }
+    pb_body = !pb_rolling; pb_hipU = hipU; pb_shU = shU; pb_wover = -9;
 
     /* ---- gambe: anca, ginocchio, caviglia, piede (i: 0 = destra, 1 = sinistra) ---- */
     for (i = 0; i < 2; i++) {
-        float side = i == 0 ? 1.15f : -1.15f;
+        float side = (i == 0 ? 1.15f : -1.15f) + legSide[i] * 1.8f;
         float a1 = legA[i], a2 = legA[i] - kneeB[i];
-        float kf = sinf(a1) * 4.9f, ku = hipU - cosf(a1) * 4.9f;
-        float af = kf + sinf(a2) * 4.9f, au = ku - cosf(a2) * 4.9f;
+        float kf = sinf(a1) * 5.3f, ku = hipU - cosf(a1) * 5.3f;
+        float af = kf + sinf(a2) * 5.2f, au = ku - cosf(a2) * 5.2f;
         if (!pb_rolling && au < 0.6f) { kf += 0; au = 0.6f; }
         /* cosciale, ginocchiello a punta, schiniere, scarpa a lame */
         mat_metal = 1;
@@ -3493,65 +3841,111 @@ static void draw_player(void)
         mat_metal = 0;
     }
 
-    /* ---- maglia, corazza, falda a lame, sopravveste, cintura ---- */
-    TEXS(TX_CLOTH, 4);
-    limbL(0, hipU - 1.0f, 0, 0, hipU + 1.2f, 0, 1.95f, 1.35f, mail);
+    /* ---- maglia, corazza a placche, falda, gonna di maglia, sopravveste, cinghie ---- */
+    TEXS(TX_CLOTH, 3);
+    limb_taper = 1.25f;
+    limbL(0.1f, hipU + 0.2f, 0, 0.15f, hipU - 4.2f, 0, 1.95f, 1.5f, mail);                       /* gonna di maglia */
+    limb_taper = 1.0f;
     mat_metal = 1;
     TEXS(TX_METAL, 10);
-    blobL(lean * 0.7f + 0.3f, shU - 1.6f + breath, 0, 1.75f, 2.4f, 2.75f, steel, 6, 10);           /* petto */
-    limbL(0, hipU + 0.6f, 0, lean * 0.6f, shU - 2.2f + breath, 0, 2.2f, 1.45f, steelD);
-    limbL(lean * 0.75f + 1.45f, shU - 3.4f + breath, 0, lean * 0.8f + 1.5f, shU + 0.1f + breath, 0, 0.28f, 0.2f, bronze);   /* costola */
-    for (i = 0; i < 3; i++) {
-        float y0 = hipU + 0.9f - i * 1.15f;
-        limb_taper = 1.08f;
-        limbL(0.1f, y0, 0, 0.12f, y0 - 1.2f, 0, 2.15f + i * 0.18f, 1.5f + i * 0.1f, i == 0 ? steel : steelD);   /* falda */
+    limb_taper = 1.3f;
+    limbL(0, hipU + 0.4f, 0, lean * 0.6f, shU - 2.4f + breath, 0, 1.75f, 1.3f, steelD);          /* vita stretta, torace largo */
+    limb_taper = 1.0f;
+    blobL(lean * 0.7f + 0.35f, shU - 1.5f + breath, 0, 1.8f, 2.3f, 2.9f, steel, 6, 10);           /* petto */
+    blobL(lean * 0.7f + 1.1f, shU - 1.0f + breath, 0.95f, 1.1f, 1.3f, 1.2f, steel, 4, 8);         /* placche pettorali */
+    blobL(lean * 0.7f + 1.1f, shU - 1.0f + breath, -0.95f, 1.1f, 1.3f, 1.2f, steel, 4, 8);
+    limbL(lean * 0.75f + 1.65f, shU - 3.4f + breath, 0, lean * 0.8f + 1.75f, shU + 0.2f + breath, 0, 0.26f, 0.2f, bronze);   /* costola */
+    for (i = 0; i < 3; i++) {   /* lame dell'addome */
+        float y0 = hipU + 2.6f - i * 0.75f;
+        limbL(lean * 0.3f + 0.15f, y0, 0, lean * 0.3f + 0.15f, y0 - 0.7f, 0, 1.85f + i * 0.08f, 1.38f + i * 0.05f, i & 1 ? steelD : steel);
+    }
+    for (i = 0; i < 3; i++) {   /* falda a lame sui fianchi */
+        float y0 = hipU + 0.6f - i * 1.05f;
+        limb_taper = 1.1f;
+        limbL(0.1f, y0, 0, 0.12f, y0 - 1.1f, 0, 2.15f + i * 0.2f, 1.55f + i * 0.1f, i == 0 ? steel : steelD);
         limb_taper = 1.0f;
     }
     mat_metal = 0;
     TEXS(TX_CLOTH, 6);
     {
-        float sw2 = mvAmt * sinf(p) * 0.6f;
-        limbL(1.25f, hipU + 0.4f, 0, 1.5f + sw2, hipU - 5.6f, 0, 1.25f, 0.18f, tunic);               /* sopravveste davanti */
-        limbL(1.5f + sw2, hipU - 5.2f, 0, 1.55f + sw2, hipU - 5.9f, 0, 1.27f, 0.2f, ember);           /* orlo di brace */
-        limbL(-1.3f, hipU + 0.4f, 0, -1.6f - sw2 - mvAmt, hipU - 5.6f, 0, 1.25f, 0.18f, shade(tunic, 0.85f));
+        float sw2 = mvAmt * sinf(p) * 0.6f + (P.sprint ? 0.8f : 0);
+        limbL(1.45f, hipU + 0.3f, 0, 1.7f + sw2, hipU - 6.2f, 0, 1.15f, 0.16f, tunic);                /* sopravveste davanti */
+        limbL(1.7f + sw2, hipU - 5.8f, 0, 1.75f + sw2, hipU - 6.5f, 0, 1.17f, 0.18f, ember);           /* orlo di brace */
+        limbL(-1.45f, hipU + 0.3f, 0, -1.8f - sw2 - mvAmt, hipU - 6.0f, 0, 1.15f, 0.16f, shade(tunic, 0.85f));
     }
     TEXS(TX_WOOD, 5);
-    limbL(0.05f, hipU + 0.5f, 0, 0.05f, hipU + 1.3f, 0, 2.3f, 1.6f, leather);
+    limbL(0.05f, hipU + 0.45f, 0, 0.05f, hipU + 1.25f, 0, 2.25f, 1.65f, leather);                 /* cintura */
+    /* cinghie incrociate sul petto e borsa al fianco */
+    limbL(lean * 0.7f + 1.75f, shU + 0.4f + breath, 1.9f, lean * 0.5f + 1.55f, hipU + 1.4f, -1.5f, 0.24f, 0.12f, leather);
+    limbL(lean * 0.7f - 1.5f, shU + 0.4f + breath, 1.9f, lean * 0.5f - 1.3f, hipU + 1.4f, -1.5f, 0.24f, 0.12f, leather);
+    blobL(-0.6f, hipU - 0.2f, 2.1f, 0.8f, 0.9f, 0.5f, leather, 3, 6);
     mat_metal = 1;
     TEXS(TX_METAL, 6);
-    limbL(1.65f, hipU + 0.55f, 0, 1.65f, hipU + 1.25f, 0, 0.55f, 0.15f, bronze);  /* fibbia */
-    /* gorgiera */
+    blobL(1.75f, hipU + 0.85f, 0, 0.22f, 0.45f, 0.55f, bronze, 3, 6);                              /* fibbia */
+    /* gorgiera a due anelli */
     limb_taper = 0.85f;
-    limbL(lean * 0.8f + 0.2f, shU - 0.2f + breath, 0, lean * 0.85f + 0.3f, shU + 1.4f + breath, 0, 1.25f, 1.25f, steelD);
+    limbL(lean * 0.8f + 0.2f, shU - 0.2f + breath, 0, lean * 0.85f + 0.3f, shU + 1.0f + breath, 0, 1.45f, 1.4f, steelD);
+    limbL(lean * 0.85f + 0.3f, shU + 0.9f + breath, 0, lean * 0.9f + 0.35f, shU + 1.6f + breath, 0, 1.15f, 1.15f, steel);
     limb_taper = 1.0f;
     mat_metal = 0;
 
     /* ---- mantellina e cappa sulle spalle ---- */
+    mat_metal = 1; TEXS(TX_METAL, 8);
+    blobL(lean * 0.7f - 0.5f, shU - 1.4f + breath, 0, 1.5f, 2.3f, 2.75f, steel, 5, 10);     /* schienale */
+    limbL(lean * 0.7f - 1.85f, shU - 3.6f + breath, 0, lean * 0.75f - 1.9f, shU + 0.3f + breath, 0, 0.22f, 0.18f, bronze);
+    mat_metal = 0;
     TEXS(TX_CLOTH, 8);
     cloth_cape(shU + breath, lean, sway, cape);
     /* spallacci a lame sovrapposte */
     mat_metal = 1;
     TEXS(TX_METAL, 8);
     for (i = 0; i < 2; i++) {
-        float ss = i ? -2.75f : 2.75f, sf = lean * 0.8f + 0.1f, su = shU + breath;
-        blobL(sf, su + 0.5f, ss, 1.55f, 1.15f, 1.5f, steel, 5, 8);
-        blobL(sf, su - 0.35f, ss * 1.08f, 1.6f, 0.75f, 1.45f, steelD, 4, 8);
-        blobL(sf, su - 1.1f, ss * 1.12f, 1.5f, 0.6f, 1.3f, steel, 4, 8);
-        limbL(sf - 1.4f, su + 1.45f, ss * 0.92f, sf + 1.4f, su + 1.45f, ss * 0.92f, 0.22f, 0.22f, bronze);
+        float ss = i ? -2.95f : 2.95f, sf = lean * 0.8f + 0.1f, su = shU + breath;
+        blobL(sf, su + 0.6f, ss, 1.65f, 1.0f, 1.55f, steel, 6, 10);
+        blobL(sf, su - 0.15f, ss * 1.07f, 1.7f, 0.6f, 1.45f, steelD, 4, 10);
+        blobL(sf, su - 0.8f, ss * 1.12f, 1.55f, 0.5f, 1.3f, steel, 4, 10);
+        blobL(sf, su - 1.4f, ss * 1.15f, 1.35f, 0.45f, 1.1f, steelD, 4, 8);
+        limbL(sf - 1.7f, su + 1.8f, ss * 0.9f, sf + 1.7f, su + 1.8f, ss * 0.9f, 0.24f, 0.24f, bronze);   /* bordo in bronzo */
+        limbL(sf + 1.2f, su + 0.4f, ss * 0.55f, sf + 1.3f, su + 1.3f, ss * 0.55f, 0.75f, 0.12f, steel);    /* rondella */
+        limbL(sf - 0.3f, su + 2.0f, ss * 0.95f, sf - 0.1f, su + 2.9f, ss * 0.85f, 0.5f, 0.12f, steelD);     /* aletta alzata */
     }
     mat_metal = 0;
 
     /* ---- braccio sinistro (lanterna/fiala) ---- */
+    pb_wover = 1;
     {
-        float sf = lean * 0.8f + 0.1f, su = shU + breath, ss = -2.6f;
+        float sf = lean * 0.8f + 0.1f, su = shU + breath, ss = -2.9f;
         float ef, eu, es, hf2, hu2, hs2;
         if (P.state == PS_HEAL) {
             float t = P.timer < 20 ? P.timer / 20.0f : (P.timer > 34 ? (44 - P.timer) / 10.0f : 1);
             ef = sf + 2.5f * t + 0.3f; eu = su - 3.5f + 1.5f * t; es = ss - 0.4f;
             hf2 = ef + 1.5f * t; hu2 = eu + 3.0f * t - (1 - t) * 3.5f; hs2 = ss + 1.8f * t;
         } else {
+            static float sGrip;
+            float tg = 0;
             ef = sf + sinf(armA[1]) * 4.2f; eu = su - cosf(armA[1]) * 4.2f; es = ss - 0.35f;
-            hf2 = ef + sinf(armA[1] + 0.35f) * 3.8f; hu2 = eu - cosf(armA[1] + 0.35f) * 3.8f; hs2 = es + 0.1f;
+            {
+                float eb = 0.35f + (P.sprint ? 1.25f : 0.35f) * mvAmt;   /* gomito piegato quando si corre */
+                hf2 = ef + sinf(armA[1] + eb) * 3.8f; hu2 = eu - cosf(armA[1] + eb) * 3.8f; hs2 = es + 0.1f;
+            }
+            if (attacking && P.atk != AT_RUN) {
+                /* presa a due mani: la sinistra afferra l'impugnatura sotto la destra */
+                float hh[3], dd[3], dl, gf, gu, gs, dx2, dy2, dz2, reach;
+                arc_pose(P.atk, (float)P.timer, sf, su, hh, dd);
+                dl = sqrtf(dd[0] * dd[0] + dd[1] * dd[1] + dd[2] * dd[2]) + 0.0001f;
+                gf = hh[0] - dd[0] / dl * 1.5f; gu = hh[1] - dd[1] / dl * 1.5f; gs = hh[2] - dd[2] / dl * 1.5f;
+                dx2 = gf - sf; dy2 = gu - su; dz2 = gs - ss; reach = sqrtf(dx2 * dx2 + dy2 * dy2 + dz2 * dz2);
+                if (reach < 8.4f) {
+                    float bend = (8.4f - reach) * 0.35f;
+                    tg = 1;
+                    hf2 += (gf - hf2) * sGrip; hu2 += (gu - hu2) * sGrip; hs2 += (gs - hs2) * sGrip;
+                    {
+                        float mf = (sf + hf2) * 0.5f, mu = (su + hu2) * 0.5f - bend * 0.8f, ms = (ss + hs2) * 0.5f - bend * 0.6f;
+                        ef += (mf - ef) * sGrip; eu += (mu - eu) * sGrip; es += (ms - es) * sGrip;
+                    }
+                }
+            }
+            sGrip += (tg - sGrip) * 0.45f;
         }
         mat_metal = 1;
         TEXS(TX_METAL, 8);
@@ -3572,6 +3966,7 @@ static void draw_player(void)
         }
     }
 
+    pb_wover = -9;
     /* ---- lanterna appesa al fianco sinistro ---- */
     {
         float lsw = sinf(p) * 0.6f * mvAmt;
@@ -3587,34 +3982,39 @@ static void draw_player(void)
     }
 
     /* ---- braccio destro e sciabola ---- */
+    pb_wover = 1;
     {
-        float sf = lean * 0.8f + 0.1f, su = shU + breath, ss = 2.6f;
+        float sf = lean * 0.8f + 0.1f, su = shU + breath, ss = 2.9f;
         float ef, eu, es;
-        if (attacking && P.atk == 0) {
-            int W = AW[0], A = AA[0];
-            float rel;
-            if (P.timer <= W) rel = 1.7f * ((float)P.timer / W);
-            else if (P.timer <= W + A) rel = 1.7f - 3.4f * ((float)(P.timer - W) / A);
-            else rel = -1.7f;
-            hf = sf + cosf(rel) * 6.8f; hu = su - 1.6f; hs = ss * 0.4f + sinf(rel) * 6.8f;
-            ef = (sf + hf) * 0.5f; eu = (su + hu) * 0.5f - 1.0f; es = (ss + hs) * 0.5f + 0.6f;
-            swF = cosf(rel); swU = -0.08f; swS = sinf(rel);
-        } else if (attacking && P.atk == 1) {
-            /* colpo pesante dall'alto */
-            int W = AW[1], A = AA[1];
-            float e;
-            if (P.timer <= W) e = 2.3f * ((float)P.timer / W);
-            else if (P.timer <= W + A) e = 2.3f - 3.0f * ((float)(P.timer - W) / A);
-            else e = -0.7f;
-            hf = sf + cosf(e) * 6.2f; hu = su + sinf(e) * 6.2f - 0.8f; hs = 0.9f;
-            ef = (sf + hf) * 0.5f - 0.4f; eu = (su + hu) * 0.5f; es = 2.4f;
-            swF = cosf(e + 0.25f); swU = sinf(e + 0.25f); swS = -0.05f;
+        static float sHf, sHu, sHs, sSwF = 0.88f, sSwU = -0.22f, sSwS = 0.42f;
+        float thf, thu, ths, tsF, tsU, tsS, kk;
+        int W = AW[P.atk], A = AA[P.atk];
+        float tw = attacking ? (P.timer < W ? (float)P.timer / W : 1.0f) : 0;
+        float ta = attacking ? (P.timer <= W ? 0 : (P.timer >= W + A ? 1 : (float)(P.timer - W) / A)) : 0;
+        tw = tw * tw * (3 - 2 * tw);                       /* carica: accelera e rallenta */
+        ta = 1 - (1 - ta) * (1 - ta) * (1 - ta);           /* colpo: velocissimo all'inizio */
+        if (attacking) {
+            float hh[3], dd[3];
+            arc_pose(P.atk, (float)P.timer, sf, su, hh, dd);
+            thf = hh[0]; thu = hh[1]; ths = hh[2]; tsF = dd[0]; tsU = dd[1]; tsS = dd[2];
+        } else if (P.sprint) {
+            /* in corsa la lama resta bassa e indietro */
+            float sw = armA[0];
+            thf = sf - 1.0f + sinf(sw) * 3.0f; thu = su - 5.5f + fabsf(sw) * 0.8f; ths = ss + 0.6f;
+            tsF = -0.6f - sw * 0.2f; tsU = -0.5f; tsS = 0.4f;
         } else {
             float a = armA[0] * 0.6f;
-            ef = sf + sinf(a) * 4.2f + 0.4f; eu = su - cosf(a) * 4.2f; es = ss + 0.3f;
-            hf = ef + 3.4f; hu = eu - 1.3f; hs = es - 0.2f;
-            swF = 0.88f; swU = -0.22f; swS = 0.42f;
+            float ef0 = sf + sinf(a) * 4.2f + 0.4f, eu0 = su - cosf(a) * 4.2f;
+            thf = ef0 + 3.4f; thu = eu0 - 1.3f; ths = ss + 0.1f;
+            tsF = 0.88f; tsU = -0.22f; tsS = 0.42f;
         }
+        /* sfumatura: fuori dai colpi la lama torna morbidamente in guardia */
+        kk = attacking ? (P.timer > W - 3 && P.timer <= W + A + 1 ? 1.0f : 0.6f) : 0.3f;
+        if (sHu == 0) { sHf = thf; sHu = thu; sHs = ths; }
+        sHf += (thf - sHf) * kk; sHu += (thu - sHu) * kk; sHs += (ths - sHs) * kk;
+        sSwF += (tsF - sSwF) * kk; sSwU += (tsU - sSwU) * kk; sSwS += (tsS - sSwS) * kk;
+        hf = sHf; hu = sHu; hs = sHs; swF = sSwF; swU = sSwU; swS = sSwS;
+        ef = (sf + hf) * 0.5f - 0.2f; eu = (su + hu) * 0.5f - 0.9f; es = (ss + hs) * 0.5f + 0.7f;
         mat_metal = 1;
         TEXS(TX_METAL, 8);
         limb_taper = 0.88f;
@@ -3627,7 +4027,7 @@ static void draw_player(void)
         mat_metal = 0;
         {
             float l = sqrtf(swF * swF + swU * swU + swS * swS);
-            float bl = attacking ? (P.atk ? 17.0f : 15.5f) : 14.5f;
+            float bl = attacking ? (P.atk == AT_HEAVY ? 17.0f : 15.5f) : 14.5f;
             float g0f, g0u, g0s;
             swF /= l; swU /= l; swS /= l;
             /* impugnatura, guardia, lama */
@@ -3635,11 +4035,51 @@ static void draw_player(void)
             limbL(hf - swF * 2.2f, hu - swU * 2.2f, hs - swS * 2.2f, hf + swF * 0.6f, hu + swU * 0.6f, hs + swS * 0.6f, 0.35f, 0.35f, leather);
             g0f = hf + swF * 0.8f; g0u = hu + swU * 0.8f; g0s = hs + swS * 0.8f;
             TEXS(TX_METAL, 6);
-            limbL(g0f - swS * 1.3f, g0u, g0s + swF * 1.3f, g0f + swS * 1.3f, g0u, g0s - swF * 1.3f, 0.3f, 0.3f, RGB(210, 175, 100));
-            limbL(g0f, g0u, g0s, g0f + swF * bl, g0u + swU * bl, g0s + swS * bl, 0.12f, 0.55f, metalc);
-            if (attacking && P.timer > AW[P.atk] && P.timer <= AW[P.atk] + AA[P.atk]) {
+            mat_metal = 1;
+            /* pomolo a disco e guardia ricurva verso la lama */
+            blobL(hf - swF * 2.5f, hu - swU * 2.5f, hs - swS * 2.5f, 0.55f, 0.55f, 0.55f, bronze, 3, 6);
+            limbL(g0f, g0u, g0s, g0f - swS * 1.5f + swF * 0.6f, g0u + swU * 0.6f, g0s + swF * 1.5f + swS * 0.6f, 0.32f, 0.26f, bronze);
+            limbL(g0f, g0u, g0s, g0f + swS * 1.5f + swF * 0.6f, g0u + swU * 0.6f, g0s - swF * 1.5f + swS * 0.6f, 0.32f, 0.26f, bronze);
+            blobL(g0f + swF * 0.2f, g0u + swU * 0.2f, g0s + swS * 0.2f, 0.4f, 0.4f, 0.4f, ember, 3, 5);   /* gemma di brace */
+            limb_taper = 0.35f;
+            limbL(g0f, g0u, g0s, g0f + swF * bl, g0u + swU * bl, g0s + swS * bl, 0.13f, 0.6f, metalc);
+            limb_taper = 1.0f;
+            mat_metal = 0;
+            /* sguscio centrale (linea scura lungo la lama) */
+            limbL(g0f + swF * 0.6f, g0u + swU * 0.6f, g0s + swS * 0.6f, g0f + swF * bl * 0.7f, g0u + swU * bl * 0.7f, g0s + swS * bl * 0.7f, 0.15f, 0.12f, shade(metalc, 0.45f));
+            {
+                int act = attacking && P.timer > AW[P.atk] - 1 && P.timer <= AW[P.atk] + AA[P.atk] + 2;
                 V3 tip = L2W(g0f + swF * bl, g0u + swU * bl, g0s + swS * bl);
-                glow(tip.x, tip.y, tip.z, 6, rgba(RGB(220, 230, 255), 160));
+                V3 bas = L2W(g0f + swF * bl * 0.55f, g0u + swU * bl * 0.55f, g0s + swS * bl * 0.55f);
+                int k2;
+                if (act) {
+                    int sub;
+                    /* tre campioni per fotogramma lungo l'arco vero: la scia resta curva anche nei colpi rapidi */
+                    for (sub = 2; sub >= 0; sub--) {
+                        V3 tb, tt;
+                        if (sub == 0) { tb = bas; tt = tip; }
+                        else {
+                            float hh[3], dd[3], dl;
+                            arc_pose(P.atk, P.timer - sub / 3.0f, sf, su, hh, dd);
+                            dl = sqrtf(dd[0] * dd[0] + dd[1] * dd[1] + dd[2] * dd[2]) + 0.0001f;
+                            dd[0] /= dl; dd[1] /= dl; dd[2] /= dl;
+                            tt = L2W(hh[0] + dd[0] * (bl + 0.8f), hh[1] + dd[1] * (bl + 0.8f), hh[2] + dd[2] * (bl + 0.8f));
+                            tb = L2W(hh[0] + dd[0] * (bl * 0.55f + 0.8f), hh[1] + dd[1] * (bl * 0.55f + 0.8f), hh[2] + dd[2] * (bl * 0.55f + 0.8f));
+                        }
+                        if (trN < TRMAX) trN++;
+                        for (k2 = trN - 1; k2 > 0; k2--) { trB[k2] = trB[k2 - 1]; trT[k2] = trT[k2 - 1]; }
+                        trB[0] = tb; trT[0] = tt;
+                    }
+                    glow(tip.x, tip.y, tip.z, 5, rgba(RGB(255, 200, 150), 150));
+                    {   /* la lama stessa arde durante il colpo */
+                        int q;
+                        for (q = 1; q <= 3; q++) {
+                            V3 bp = L2W(g0f + swF * bl * q * 0.25f, g0u + swU * bl * q * 0.25f, g0s + swS * bl * q * 0.25f);
+                            glow(bp.x, bp.y, bp.z, 2.2f + q * 0.4f, rgba(RGB(255, 140, 50), 150));
+                        }
+                    }
+                } else if (trN > 0) trN -= 4;
+                if (trN < 0) trN = 0;
             }
         }
         mat_metal = 1; TEXS(TX_METAL, 6);
@@ -3647,38 +4087,70 @@ static void draw_player(void)
         mat_metal = 0;
     }
 
-    /* ---- elmo chiuso: calotta arrotondata, visiera con fessura, cresta ---- */
+    pb_wover = -9;
+    /* ---- elmo chiuso: calotta a cresta, paranuca, guanciali, visiera a spigolo ---- */
     {
-        float hfb = lean * 0.9f + 0.35f, hub = shU + 1.2f + breath;
+        float hfb = lean * 0.9f + 0.35f, hub = shU + 1.4f + breath;
         mat_metal = 1;
         TEXS(TX_METAL, 8);
-        blobL(hfb + 0.1f, hub + 2.2f, 0, 1.75f, 2.05f, 1.6f, steel, 7, 12);           /* calotta */
-        blobL(hfb + 0.75f, hub + 1.25f, 0, 1.3f, 1.25f, 1.42f, steelD, 5, 10);         /* mentoniera */
-        limbL(hfb + 1.55f, hub + 2.9f, 0, hfb + 1.62f, hub + 0.6f, 0, 0.32f, 0.3f, steel);   /* spigolo della visiera */
-        limbL(hfb - 1.55f, hub + 4.0f, 0, hfb + 1.4f, hub + 4.05f, 0, 0.22f, 0.32f, bronze); /* cresta */
-        blobL(hfb - 0.2f, hub + 0.4f, 0, 1.6f, 0.5f, 1.65f, bronze, 3, 10);              /* bordo inferiore */
+        blobL(hfb + 0.1f, hub + 2.3f, 0, 1.8f, 2.1f, 1.6f, steel, 7, 12);              /* calotta */
+        blobL(hfb - 0.7f, hub + 1.5f, 0, 1.2f, 1.2f, 1.6f, steel, 5, 10);              /* paranuca */
+        limbL(hfb - 1.8f, hub + 1.0f, 0, hfb - 2.6f, hub - 0.2f, 0, 1.5f, 0.25f, steelD); /* falda posteriore */
+        blobL(hfb + 0.8f, hub + 1.2f, 1.05f, 1.15f, 1.35f, 0.5f, steelD, 4, 8);         /* guanciali */
+        blobL(hfb + 0.8f, hub + 1.2f, -1.05f, 1.15f, 1.35f, 0.5f, steelD, 4, 8);
+        limbL(hfb + 1.6f, hub + 3.0f, 0, hfb + 2.0f, hub + 0.7f, 0, 0.35f, 0.6f, steel); /* spigolo della visiera */
+        limbL(hfb - 1.9f, hub + 4.0f, 0, hfb + 1.3f, hub + 4.25f, 0, 0.16f, 0.5f, bronze); /* cresta alta */
+        limbL(hfb - 2.2f, hub + 3.3f, 0, hfb - 1.9f, hub + 4.0f, 0, 0.14f, 0.4f, bronze);
+        blobL(hfb - 0.1f, hub + 0.45f, 0, 1.75f, 0.45f, 1.8f, bronze, 3, 10);           /* bordo inferiore */
         mat_metal = 0;
         TEXS(TX_WHITE, 32);
-        /* fessura degli occhi (buia) e fori di respirazione */
-        limbL(hfb + 1.45f, hub + 2.55f, -1.1f, hfb + 1.45f, hub + 2.55f, 1.1f, 0.18f, 0.22f, RGB(8, 8, 10));
-        for (i = 0; i < 3; i++) {
-            limbL(hfb + 1.5f, hub + 1.35f, 0.45f + i * 0.28f, hfb + 1.5f, hub + 1.65f, 0.45f + i * 0.28f, 0.06f, 0.08f, RGB(10, 10, 12));
-            limbL(hfb + 1.5f, hub + 1.35f, -0.45f - i * 0.28f, hfb + 1.5f, hub + 1.65f, -0.45f - i * 0.28f, 0.06f, 0.08f, RGB(10, 10, 12));
+        /* fessura degli occhi con un tenue bagliore e fori di respirazione */
+        limbL(hfb + 1.6f, hub + 2.55f, -1.15f, hfb + 1.75f, hub + 2.5f, 1.15f, 0.16f, 0.2f, RGB(8, 8, 10));
+        {
+            V3 ey = L2W(hfb + 1.8f, hub + 2.55f, 0);
+            glow(ey.x, ey.y, ey.z, 1.6f, rgba(RGB(255, 150, 70), 90));
         }
-        /* lembo di stoffa dietro l'elmo */
+        for (i = 0; i < 4; i++) {
+            limbL(hfb + 1.75f, hub + 1.3f, 0.4f + i * 0.25f, hfb + 1.7f, hub + 1.6f, 0.4f + i * 0.25f, 0.05f, 0.07f, RGB(10, 10, 12));
+            limbL(hfb + 1.75f, hub + 1.3f, -0.4f - i * 0.25f, hfb + 1.7f, hub + 1.6f, -0.4f - i * 0.25f, 0.05f, 0.07f, RGB(10, 10, 12));
+        }
+        /* nastri di stoffa che scendono dall'elmo */
         TEXS(TX_CLOTH, 6);
-        limbL(hfb - 1.5f, hub + 2.6f, 0, hfb - 2.6f - mvAmt, hub - 1.0f, 0, 0.8f, 0.2f, capeD);
+        limb_taper = 0.4f;
+        limbL(hfb - 2.2f, hub + 3.5f, 0, hfb - 3.6f - mvAmt * 1.8f, hub + 1.2f - mvAmt, sway * 0.4f, 0.35f, 0.3f, capeD);   /* pennacchio corto */
+        limb_taper = 1.0f;
     }
     hi_detail = 0;
+    pb_body = 0;
 
     /* scia del fendente e cura */
-    if (attacking && P.timer > AW[P.atk] && P.timer <= AW[P.atk] + AA[P.atk] && P.atk == 0) {
-        float prog = (float)(P.timer - AW[0]) / AA[0];
-        cur_gy = ground_h(x, z);
-        fan(x, z, 14.5f, 15, 24, ang + 1.4f - 2.8f * prog, ang + 1.4f, rgba(RGB(230, 235, 255), 90), 12);
-        cur_gy = 0;
+    if (attacking && P.atk == AT_HEAVY && P.charge > 0 && P.timer < AW[AT_HEAVY]) {
+        V3 c = L2W(1.5f, 22, 1);
+        glow(c.x, c.y, c.z, 4 + P.charge * 0.35f, rgba(RGB(255, 160, 70), 120 + (int)P.charge * 4));
     }
-    if (attacking && P.atk == 1 && P.timer == AW[1] + AA[1]) spawn_parts(x + pb_c * 16, z + pb_s * 16, 8, RGB(200, 190, 170), 1.6f);
+    /* scia di fuoco della lama: nastro che si allarga oltre la punta, bianco-giallo davanti e rosso in coda */
+    if (trN > 1) {
+        int k2;
+        float scroll = frame * 0.09f;
+        for (k2 = 0; k2 < trN - 1; k2++) {
+            float f0 = 1.0f - (float)k2 / trN, f1 = 1.0f - (float)(k2 + 1) / trN;
+            V3 b0, t0, b1, t1;
+            uint32_t c0, c1;
+            float dx0 = trT[k2].x - trB[k2].x, dy0 = trT[k2].y - trB[k2].y, dz0 = trT[k2].z - trB[k2].z;
+            float dx1 = trT[k2 + 1].x - trB[k2 + 1].x, dy1 = trT[k2 + 1].y - trB[k2 + 1].y, dz1 = trT[k2 + 1].z - trB[k2 + 1].z;
+            float w0 = 0.3f + 0.45f * (1 - f0), w1 = 0.3f + 0.45f * (1 - f1);   /* la fiamma si allarga mentre si spegne */
+            b0 = v3(trB[k2].x - dx0 * 0.6f, trB[k2].y - dy0 * 0.6f, trB[k2].z - dz0 * 0.6f);
+            t0 = v3(trT[k2].x + dx0 * w0, trT[k2].y + dy0 * w0, trT[k2].z + dz0 * w0);
+            b1 = v3(trB[k2 + 1].x - dx1 * 0.6f, trB[k2 + 1].y - dy1 * 0.6f, trB[k2 + 1].z - dz1 * 0.6f);
+            t1 = v3(trT[k2 + 1].x + dx1 * w1, trT[k2 + 1].y + dy1 * w1, trT[k2 + 1].z + dz1 * w1);
+            c0 = f0 > 0.75f ? rgba(RGB(255, 235, 170), (int)(255 * f0)) : (f0 > 0.4f ? rgba(RGB(255, 150, 50), (int)(255 * f0)) : rgba(RGB(200, 50, 15), (int)(320 * f0)));
+            c1 = f1 > 0.75f ? rgba(RGB(255, 235, 170), (int)(255 * f1)) : (f1 > 0.4f ? rgba(RGB(255, 150, 50), (int)(255 * f1)) : rgba(RGB(200, 50, 15), (int)(320 * f1)));
+            emit_quad(b0, t0, t1, b1, c0, c0, c1, c1,
+                      (float)k2 / trN + scroll, 0, (float)k2 / trN + scroll, 1, (float)(k2 + 1) / trN + scroll, 1, (float)(k2 + 1) / trN + scroll, 0,
+                      TX_FIRE, RB_ADD);
+        }
+    }
+    if (attacking && (P.atk == AT_HEAVY || P.atk == AT_L3 || P.atk == AT_RUN) && P.timer == AW[P.atk] + AA[P.atk]) spawn_parts(x + pb_c * 16, z + pb_s * 16, 8, RGB(200, 190, 170), 1.6f);
     if (P.state == PS_HEAL) { cur_gy = ground_h(x, z); ground_spot(x, z, 18, 1, rgba(RGB(255, 150, 50), 110), RB_ADD); cur_gy = 0; }
     TEXS(TX_WHITE, 32);
 }
@@ -3810,11 +4282,16 @@ static void draw_colossus(Enemy *e, float gh)
     TEXS(TX_WHITE, 32);
 }
 
+static float mvAmtE(int moving) { return moving ? 1.0f : 0.0f; }
+
 static void draw_enemy(Enemy *e)
 {
+#ifdef GAME_DEBUG
+    if (dbg_noen) return;
+#endif
     const EKind *k = &EK[e->kind];
     float x = e->x, z = e->y;
-    float ang = atan2f(e->fy, e->fx), c = cosf(ang), s = sinf(ang), sx = -s, sz = c;
+    float ang = atan2f(e->fy, e->fx), c = cosf(ang), s = sinf(ang);
     float dxp = x - P.x, dzp = z - P.y, br = sinf(frame * 0.12f + x) * 0.5f;
     uint32_t body, dark, eye = RGB(255, 80, 40);
     float gh;
@@ -3822,6 +4299,7 @@ static void draw_enemy(Enemy *e)
     light_at(x, z);
     gh = ground_h(x, z);
     cur_gy = gh;
+    lo_detail = dxp * dxp + dzp * dzp > 100 * 100;
     if (e->kind >= 2) {
         if (e->state == ES_DEAD) {
             float t = e->deadT / 40.0f;
@@ -3841,10 +4319,19 @@ static void draw_enemy(Enemy *e)
     body = e->kind ? RGB(130, 138, 154) : RGB(120, 102, 88);
     if (e->state == ES_DEAD) {
         float t = e->deadT / 40.0f;
-        TEXS(TX_CLOTH, 8);
-        box(x, 0, z, k->r * (1.6f - t * 0.6f), 3 * t + 1, k->r * 0.8f, ang, shade(body, 0.6f), shade(body, 0.6f), 1, 0);
-        TEXS(TX_WHITE, 32);
+        /* il corpo si sgretola in un cumulo di cenere con braci che si spengono */
         cur_gy = 0;
+        pb_x = x; pb_z = z; pb_c = c; pb_s = s; pb_rolling = 0; pb_y = gh;
+        TEXS(TX_CLOTH, 8);
+        blobL(-1.0f, 0.6f, 0, 4.5f - t, 1.0f + 3.0f * t, 3.2f, shade(body, 0.45f), 4, 8);
+        blobL(2.5f, 0.5f, 1.2f, 2.0f, 0.6f + 2.0f * t, 1.8f, shade(body, 0.35f), 3, 6);
+        blobL(-3.5f, 0.4f, -1.5f, 1.8f, 0.5f + 1.6f * t, 1.6f, shade(body, 0.4f), 3, 6);
+        TEXS(TX_WHITE, 32);
+        {
+            V3 em = L2W(0, 1.5f + 2 * t, 0);
+            glow(em.x, em.y, em.z, 4 + 3 * t, rgba(RGB(255, 120, 40), (int)(160 * t)));
+            if ((frame & 3) == 0 && t > 0.3f) spawn_parts(x + frnd() * 6 - 3, z + frnd() * 6 - 3, 1, RGB(255, 140, 60), 0.4f);
+        }
         return;
     }
     if (e->state == ES_WIND && (e->timer & 4)) { body = RGB(220, 70, 60); eye = RGB(255, 230, 120); }
@@ -3852,48 +4339,146 @@ static void draw_enemy(Enemy *e)
     if (e->flash > 0) body = RGB(255, 255, 255);
     dark = shade(body, 0.62f);
     shadow(x, z, k->r + 1.5f);
-    if (e->kind == 0) {
-        float a2 = ang + (e->state == ES_STRIKE ? 0.7f : (e->state == ES_WIND ? -1.4f : 0.35f));
-        TEXS(TX_BARK, 8);   /* pelle ruvida */
-        box(x - c * 1.5f + sx * 2.4f, 0, z - s * 1.5f + sz * 2.4f, 1.6f, 6, 1.4f, ang, dark, dark, 1, 0);
-        box(x - c * 1.5f - sx * 2.4f, 0, z - s * 1.5f - sz * 2.4f, 1.6f, 6, 1.4f, ang, dark, dark, 1, 0);
-        box(x - c * 0.5f, 5, z - s * 0.5f, 3.4f, 6 + br, 4.4f, ang, body, body, 1, 0);
-        box(x - c * 1.6f, 10 + br, z - s * 1.6f, 3.0f, 3, 4.8f, ang, dark, dark, 1, 0);
-        box(x - c * 2.2f, 13 + br, z - s * 2.2f, 0.6f, 2.5f, 0.6f, ang, RGB(190, 180, 170), RGB(210, 200, 190), 1, 0);
-        box(x + c * 4.2f, 8.5f + br, z + s * 4.2f, 2.4f, 3.8f, 2.4f, ang, dark, dark, 1, 0);
-        box(x + c * 5.6f, 7.6f + br, z + s * 5.6f, 1.6f, 1.6f, 1.6f, ang, shade(dark, 0.8f), shade(dark, 0.8f), 1, 0);
-        cube(x + c * 6.6f + sx * 1, 10.6f + br, z + s * 6.6f + sz * 1, 0.4f, 0, eye, 1, 1);
-        cube(x + c * 6.6f - sx * 1, 10.6f + br, z + s * 6.6f - sz * 1, 0.4f, 0, eye, 1, 1);
-        glow(x + c * 6.8f, 11.2f + br, z + s * 6.8f, 3.5f, rgba(eye, 140));
-        box(x + c * 2 - sx * 5, 2, z + s * 2 - sz * 5, 1.2f, 8, 1.2f, ang, dark, dark, 1, 0);
-        box(x + sx * 5 + cosf(a2) * 6, 6, z + sz * 5 + sinf(a2) * 6, 6, 1.8f, 1.3f, a2, dark, body, 1, 0);
-        TEXS(TX_METAL, 6);
-        box(x + sx * 5 + cosf(a2) * 12.5f, 6, z + sz * 5 + sinf(a2) * 12.5f, 1.4f, 1.2f, 1.8f, a2 + 0.3f, RGB(200, 190, 170), RGB(220, 210, 190), 1, 0);
-        TEXS(TX_CLOTH, 6);
-        box(x - c * 3.6f, 3, z - s * 3.6f, 0.6f, 4, 3.5f, ang, RGB(96, 80, 70), RGB(96, 80, 70), 1, 0);
-    } else {
-        float sl = e->state == ES_STRIKE ? 14.0f : (e->state == ES_WIND ? 1.0f : 8.0f);
-        uint32_t cloth = e->flash > 0 ? body : RGB(130, 50, 54);
-        TEXS(TX_WOOD, 6);
-        box(x + sx * 2.4f, 0, z + sz * 2.4f, 1.6f, 7, 1.4f, ang, RGB(70, 62, 60), RGB(70, 62, 60), 1, 0);
-        box(x - sx * 2.4f, 0, z - sz * 2.4f, 1.6f, 7, 1.4f, ang, RGB(70, 62, 60), RGB(70, 62, 60), 1, 0);
-        TEXS(TX_CLOTH, 8);
-        box(x - c * 0.6f, 4, z - s * 0.6f, 3.2f, 7, 4.8f, ang, shade(cloth, 0.8f), cloth, 1, 0);
-        TEXS(TX_METAL, 10);
-        box(x, 10, z, 2.8f, 7, 4.4f, ang, body, body, 1, 0);
-        box(x, 15.5f, z, 3.0f, 1.8f, 5.6f, ang, shade(body, 1.15f), shade(body, 1.15f), 1, 0);
-        box(x, 17, z, 2.5f, 5, 2.5f, ang, RGB(160, 164, 174), RGB(190, 194, 204), 1, 0);
-        box(x, 22, z, 0.6f, 4, 0.6f, ang, RGB(160, 164, 174), RGB(190, 194, 204), 1, 0);
-        TEXS(TX_WHITE, 32);
-        box(x + c * 2.6f, 19, z + s * 2.6f, 0.3f, 0.8f, 1.8f, ang, eye, eye, 1, 1);
-        glow(x + c * 2.9f, 19.4f, z + s * 2.9f, 3, rgba(eye, 120));
-        TEXS(TX_WOOD, 10);
-        box(x + c * sl + sx * 4, 11, z + s * sl + sz * 4, 15, 0.9f, 0.7f, ang, RGB(140, 110, 80), RGB(160, 130, 96), 1, 0);
-        TEXS(TX_METAL, 6);
-        box(x + c * (sl + 16) + sx * 4, 10.8f, z + s * (sl + 16) + sz * 4, 2.8f, 1.3f, 1.2f, ang, RGB(220, 222, 234), RGB(245, 246, 255), 1, 0);
-        TEXS(TX_CLOTH, 6);
-        box(x + c * (sl + 12.5f) + sx * 4, 11.2f, z + s * (sl + 12.5f) + sz * 4, 0.4f, 0.6f, 1.6f, ang, RGB(180, 40, 40), RGB(200, 50, 50), 1, 0);
+    cur_gy = 0;
+    {
+        int moving = e->state == ES_CHASE, far = dxp * dxp + dzp * dzp > 120 * 120, i;
+        float ph = frame * 0.32f + x * 0.13f, amp = moving ? 1.0f : 0.12f;
+        float wind = e->state == ES_WIND ? 1.0f : 0, strike = e->state == ES_STRIKE ? 1.0f : 0;
+        pb_x = x; pb_z = z; pb_c = c; pb_s = s; pb_rolling = 0; pb_y = gh;
+        if (e->kind == 0) {
+            /* --- Reietto: figura scarna e curva, stracci, mannaia arrugginita --- */
+            float hip = 7.4f + fabsf(sinf(ph)) * 0.4f * amp, hunch = 1.8f + wind * 0.8f - strike * 0.6f;
+            float shF = hunch + 0.4f, shU = 12.6f + br * 0.4f - hunch * 0.3f;
+            uint32_t skin = body, rag = e->flash > 0 ? body : RGB(84, 72, 62);
+            TEXS(TX_BARK, 5);
+            for (i = 0; i < 2; i++) {   /* gambe magre */
+                float sd = i ? -1.3f : 1.3f, a1 = sinf(ph + i * PI) * 0.55f * amp;
+                float kf = sinf(a1) * 3.8f + 0.4f, ku = hip - cosf(a1) * 3.8f;
+                float ff = kf + sinf(a1 - 0.35f) * 3.6f, fu = 0.3f;
+                limb_taper = 0.8f;
+                limbL(0, hip, sd, kf, ku, sd * 1.1f, 0.75f, 0.75f, dark);
+                limbL(kf, ku, sd * 1.1f, ff, fu, sd * 1.1f, 0.55f, 0.55f, dark);
+                limb_taper = 1.0f;
+                blobL(ff + 0.6f, 0.3f, sd * 1.1f, 0.9f, 0.35f, 0.55f, shade(dark, 0.8f), 3, 5);
+            }
+            /* busto curvo, costole e stracci */
+            limb_taper = 1.25f;
+            limbL(0, hip, 0, shF, shU, 0, 1.45f, 1.2f, skin);
+            limb_taper = 1.0f;
+            blobL(shF * 0.8f, shU - 1.4f, 0, 1.3f, 2.0f, 2.2f, skin, 4, 8);
+            if (!far) for (i = 0; i < 3; i++) limbL(shF * 0.6f + 1.1f, shU - 1.0f - i * 0.9f, 1.3f, shF * 0.6f + 1.2f, shU - 1.0f - i * 0.9f, -1.3f, 0.12f, 0.12f, shade(skin, 0.7f));
+            TEXS(TX_CLOTH, 5);
+            limb_taper = 1.4f;
+            limbL(0, hip + 1.2f, 0, -0.3f - mvAmtE(moving) * 0.8f, hip - 4.0f, 0, 1.9f, 1.6f, rag);       /* gonna di stracci */
+            limb_taper = 1.0f;
+            limbL(shF - 0.8f, shU + 0.6f, 0, -1.6f - mvAmtE(moving), hip - 1.5f + sinf(ph) * 0.5f, 0, 1.6f, 0.2f, shade(rag, 0.85f));   /* mantello a brandelli */
+            /* testa incassata con cappuccio */
+            TEXS(TX_BARK, 5);
+            blobL(shF + 1.4f, shU + 1.0f, 0, 1.2f, 1.35f, 1.15f, skin, 4, 8);
+            TEXS(TX_CLOTH, 5);
+            blobL(shF + 0.9f, shU + 1.5f, 0, 1.5f, 1.5f, 1.45f, rag, 4, 8);
+            TEXS(TX_WHITE, 32);
+            {
+                V3 e1 = L2W(shF + 2.5f, shU + 1.2f, 0.45f), e2 = L2W(shF + 2.5f, shU + 1.2f, -0.45f);
+                box(e1.x, e1.y - 0.15f, e1.z, 0.2f, 0.3f, 0.2f, ang, eye, eye, 1, 1);
+                box(e2.x, e2.y - 0.15f, e2.z, 0.2f, 0.3f, 0.2f, ang, eye, eye, 1, 1);
+                glow((e1.x + e2.x) * 0.5f, e1.y, (e1.z + e2.z) * 0.5f, 3.0f, rgba(eye, 130));
+            }
+            /* braccio sinistro penzolante */
+            TEXS(TX_BARK, 5);
+            {
+                float sw = sinf(ph) * 0.5f * amp;
+                limbL(shF, shU, 2.3f, shF + 0.6f + sw * 2, shU - 4.0f, 2.7f, 0.6f, 0.6f, skin);
+                limbL(shF + 0.6f + sw * 2, shU - 4.0f, 2.7f, shF + 2.2f + sw * 3, shU - 7.2f, 2.5f, 0.45f, 0.45f, skin);
+            }
+            /* braccio destro con la mannaia: alzata indietro in carica, calata nel colpo */
+            {
+                float ra = wind ? -2.4f : (strike ? 1.3f : 0.55f + sinf(ph) * 0.2f * amp);
+                float ef = shF + sinf(ra) * 3.6f, eu = shU - cosf(ra) * 3.6f;
+                float hf2 = ef + sinf(ra + 0.5f) * 3.4f, hu2 = eu - cosf(ra + 0.5f) * 3.4f;
+                float bf = sinf(ra + 1.2f), bu = -cosf(ra + 1.2f);
+                limbL(shF, shU, -2.3f, ef, eu, -2.7f, 0.6f, 0.6f, skin);
+                limbL(ef, eu, -2.7f, hf2, hu2, -2.6f, 0.48f, 0.48f, skin);
+                TEXS(TX_WOOD, 4);
+                limbL(hf2 - bf * 1.0f, hu2 - bu * 1.0f, -2.6f, hf2 + bf * 3.5f, hu2 + bu * 3.5f, -2.6f, 0.3f, 0.3f, RGB(90, 70, 50));
+                mat_metal = 1; TEXS(TX_METAL, 5);
+                limbL(hf2 + bf * 3.0f, hu2 + bu * 3.0f, -2.6f, hf2 + bf * 7.5f, hu2 + bu * 7.5f, -2.6f, 0.2f, 1.25f, RGB(150, 120, 96));
+                mat_metal = 0;
+                if (strike) {
+                    V3 tp = L2W(hf2 + bf * 7.5f, hu2 + bu * 7.5f, -2.6f);
+                    glow(tp.x, tp.y, tp.z, 4, rgba(RGB(255, 160, 110), 120));
+                }
+            }
+        } else {
+            /* --- Lanciere: soldato in armatura, elmo a punta, lunga picca e scudo --- */
+            float hip = 10.6f + fabsf(sinf(ph)) * 0.4f * amp, lean = strike * 1.6f - wind * 0.9f;
+            float shU = 18.4f + br * 0.3f, sl = strike ? 7.0f : (wind ? -3.0f : 0.0f);
+            uint32_t cloth = e->flash > 0 ? body : RGB(130, 50, 54), mtl = body, mtlD = shade(body, 0.7f);
+            mat_metal = 1;
+            TEXS(TX_METAL, 8);
+            for (i = 0; i < 2; i++) {
+                float sd = i ? -1.6f : 1.6f, st = strike ? (i ? -0.5f : 0.6f) : 0;
+                float a1 = sinf(ph + i * PI) * 0.55f * amp + st;
+                float kf = sinf(a1) * 5.0f, ku = hip - cosf(a1) * 5.0f;
+                float ff = kf + sinf(a1 - 0.4f * amp) * 5.0f, fu = 0.5f;
+                limb_taper = 0.85f;
+                limbL(0, hip, sd, kf, ku, sd, 1.05f, 1.05f, mtlD);
+                limbL(kf, ku, sd, ff, fu, sd, 0.8f, 0.8f, mtl);
+                limb_taper = 1.0f;
+                blobL(kf + 0.5f, ku, sd, 0.75f, 0.8f, 0.75f, mtl, 3, 6);    /* ginocchiera */
+                blobL(ff + 0.7f, 0.5f, sd, 1.15f, 0.5f, 0.7f, mtlD, 3, 6);
+            }
+            limb_taper = 1.3f;
+            limbL(0, hip, 0, lean, shU - 1.5f, 0, 1.9f, 1.45f, mtlD);
+            limb_taper = 1.0f;
+            blobL(lean + 0.4f, shU - 2.0f, 0, 1.9f, 2.6f, 3.0f, mtl, 5, 10);
+            blobL(lean, shU - 0.2f, 2.9f, 1.6f, 1.2f, 1.5f, mtl, 4, 8);     /* spallacci */
+            blobL(lean, shU - 0.2f, -2.9f, 1.6f, 1.2f, 1.5f, mtl, 4, 8);
+            /* elmo conico con nasale */
+            blobL(lean + 0.5f, shU + 2.6f, 0, 1.6f, 1.9f, 1.5f, mtl, 5, 9);
+            limb_taper = 0.2f;
+            limbL(lean + 0.4f, shU + 3.8f, 0, lean, shU + 7.0f, 0, 1.0f, 1.0f, shade(mtl, 1.15f));
+            limb_taper = 1.0f;
+            limbL(lean + 2.0f, shU + 3.4f, 0, lean + 2.1f, shU + 1.6f, 0, 0.18f, 0.35f, mtlD);
+            mat_metal = 0;
+            TEXS(TX_CLOTH, 6);
+            limbL(1.6f, hip + 2.0f, 0, 1.9f + strike, hip - 6.5f, 0, 1.4f, 0.16f, cloth);                  /* tabarro */
+            limbL(-1.5f, hip + 2.0f, 0, -2.0f - mvAmtE(moving), hip - 6.0f, 0, 1.4f, 0.16f, shade(cloth, 0.8f));
+            limbL(lean - 1.0f, shU + 0.6f, 0, -2.6f - mvAmtE(moving) * 1.5f, hip - 4.0f + sinf(ph) * 0.4f, 0, 2.4f, 0.2f, shade(cloth, 0.7f));   /* mantella */
+            TEXS(TX_WHITE, 32);
+            {
+                V3 ey = L2W(lean + 2.05f, shU + 2.6f, 0);
+                box(ey.x, ey.y - 0.2f, ey.z, 0.25f, 0.4f, 1.0f, ang, eye, eye, 1, 1);
+                glow(ey.x, ey.y, ey.z, 3, rgba(eye, 120));
+            }
+            /* scudo sul braccio sinistro */
+            mat_metal = 1; TEXS(TX_METAL, 6);
+            limbL(lean, shU - 0.6f, 3.1f, lean + 2.2f, shU - 4.5f, 3.4f, 0.7f, 0.7f, mtlD);
+            blobL(lean + 3.0f, shU - 5.5f, 3.9f, 2.6f, 3.6f, 0.5f, shade(cloth, 0.9f), 4, 8);
+            blobL(lean + 3.3f, shU - 5.5f, 4.3f, 0.6f, 0.6f, 0.35f, RGB(200, 170, 110), 3, 5);
+            /* picca tenuta a due mani all'altezza del fianco */
+            {
+                float pu = 12.0f + (wind ? 1.2f : 0), base = -6.0f + sl, tipf = 26.0f + sl;
+                limbL(lean, shU - 0.6f, -3.0f, lean + 2.0f + sl * 0.4f, pu + 0.6f, -2.8f, 0.7f, 0.7f, mtlD);
+                TEXS(TX_WOOD, 10);
+                mat_metal = 0;
+                limbL(base, pu - 0.6f, -2.2f, tipf - 3.0f, pu + 0.3f, -2.0f, 0.3f, 0.3f, RGB(140, 110, 80));
+                mat_metal = 1; TEXS(TX_METAL, 6);
+                limb_taper = 0.15f;
+                limbL(tipf - 3.2f, pu + 0.25f, -2.0f, tipf, pu + 0.35f, -2.0f, 0.18f, 0.75f, RGB(225, 228, 240));
+                limb_taper = 1.0f;
+                mat_metal = 0;
+                TEXS(TX_CLOTH, 4);
+                limbL(tipf - 3.6f, pu + 0.3f, -2.0f, tipf - 4.6f - mvAmtE(moving) * 1.5f, pu - 1.8f, -2.2f, 0.5f, 0.12f, RGB(180, 40, 40));
+                if (strike) {
+                    V3 tp = L2W(tipf, pu + 0.35f, -2.0f);
+                    TEXS(TX_WHITE, 32);
+                    glow(tp.x, tp.y, tp.z, 4.5f, rgba(RGB(230, 235, 255), 140));
+                }
+            }
+        }
     }
+    cur_gy = gh;
     TEXS(TX_WHITE, 32);
     if (e->hp < k->hp) hpbar3d(x, z, e->kind ? 29.0f : 20.0f, (float)e->hp / k->hp, 8);
     cur_gy = 0;
@@ -3937,51 +4522,143 @@ static void draw_boss(void)
     if (Bs.state == BS_WIND && Bs.atk == BA_SWIPE && (Bs.timer & 4)) body = RGB(200, 90, 70);
     if (Bs.flash > 0) body = RGB(255, 240, 220);
     dark = shade(body, 0.6f);
-    TEXS(TX_STONE, 14);   /* corpo di cenere pietrificata */
-    box(x + sx * 7, y, z + sz * 7, 4, 14, 3.5f, ang, dark, dark, 1, 0);
-    box(x - sx * 7, y, z - sz * 7, 4, 14, 3.5f, ang, dark, dark, 1, 0);
-    TEXS(TX_CLOTH, 10);
-    for (i = -2; i <= 2; i++) {
-        float sway = sinf(frame * 0.06f + i) * 1.2f;
-        box(x - c * (9 + sway) + sx * i * 5, y + 3 + (i & 1) * 2, z - s * (9 + sway) + sz * i * 5,
-            1.2f, 26 - (i & 1) * 4, 2.6f, ang, RGB(80, 74, 74), RGB(96, 90, 90), 1, 0);
-    }
-    TEXS(TX_STONE, 14);
-    box(x, y + 12, z, 8, 18 + br, 13, ang, body, body, 1, 0);
-    TEXS(TX_WHITE, 32);
-    box(x + c * 8.2f, y + 17, z + s * 8.2f, 0.5f, 8, 1.2f, ang, ember, ember, 1, 1);
-    box(x + c * 8.2f + sx * 5, y + 22, z + s * 8.2f + sz * 5, 0.5f, 1.2f, 4, ang, ember, ember, 1, 1);
-    box(x + c * 8.2f - sx * 6, y + 15, z + s * 8.2f - sz * 6, 0.5f, 5, 0.9f, ang, ember, ember, 1, 1);
-    glow(x + c * 9, y + 20, z + s * 9, 14, rgba(ember, 110));
-    TEXS(TX_METAL, 12);
-    box(x - c * 2.5f, y + 30 + br, z - s * 2.5f, 9, 4, 15.5f, ang, RGB(96, 90, 88), RGB(110, 104, 100), 1, 0);
-    for (i = 0; i < 5; i++)
-        box(x + c * 8.6f + sx * (-10 + i * 4.5f), y + 11 - (i == 2 ? 2 : (i & 1)), z + s * 8.6f + sz * (-10 + i * 4.5f), 0.9f, 1.8f, 0.9f, ang + i, RGB(140, 138, 144), RGB(160, 158, 164), 1, 0);
-    TEXS(TX_STONE, 10);
-    box(x + c * 4, y + 30 + br, z + s * 4, 5.5f, 8, 5.5f, ang, dark, dark, 1, 0);
-    TEXS(TX_WHITE, 32);
-    box(x + c * 9.7f + sx * 2.5f, y + 34 + br, z + s * 9.7f + sz * 2.5f, 0.4f, 1.5f, 1, ang, ember, ember, 1, 1);
-    box(x + c * 9.7f - sx * 2.5f, y + 34 + br, z + s * 9.7f - sz * 2.5f, 0.4f, 1.5f, 1, ang, ember, ember, 1, 1);
-    glow(x + c * 10, y + 35 + br, z + s * 10, 7, rgba(ember, 170));
-    TEXS(TX_BARK, 8);   /* corna */
-    box(x + c * 3 + sx * 7, y + 36 + br, z + s * 3 + sz * 7, 1.3f, 9, 1.3f, ang, RGB(220, 210, 190), RGB(240, 230, 210), 1, 0);
-    box(x + c * 3 - sx * 7, y + 36 + br, z + s * 3 - sz * 7, 1.3f, 9, 1.3f, ang, RGB(220, 210, 190), RGB(240, 230, 210), 1, 0);
-    box(x + c * 1 + sx * 9, y + 44 + br, z + s * 1 + sz * 9, 1, 6, 1, ang, RGB(220, 210, 190), RGB(240, 230, 210), 1, 0);
-    box(x + c * 1 - sx * 9, y + 44 + br, z + s * 1 - sz * 9, 1, 6, 1, ang, RGB(220, 210, 190), RGB(240, 230, 210), 1, 0);
+    /* --- Custode Cinereo: gigante di pietra e cenere, maschera cornuta, cuore di brace --- */
     {
-        float a2 = ang + 0.9f, shx = x + sx * 15, shz = z + sz * 15;
-        if (Bs.state == BS_WIND && Bs.atk == BA_SWIPE) a2 = ang - 1.8f;
-        if (Bs.state == BS_ACT && Bs.atk == BA_SWIPE) a2 = ang - 1.8f + 3.6f * (12 - Bs.timer) / 12.0f;
+        int slamW = Bs.state == BS_WIND && Bs.atk == BA_SLAM, slamA = Bs.state == BS_ACT && Bs.atk == BA_SLAM;
+        int chg = (Bs.state == BS_WIND || Bs.state == BS_ACT) && Bs.atk == BA_CHARGE;
+        float lean = chg ? 5.0f : (slamA ? 4.0f : (slamW ? -2.0f : 1.5f));
+        float hip = 20.0f + br * 0.5f - (slamA ? 3.0f : 0), shU = 38.0f + br - (slamA ? 4.0f : 0);
+        float wk = frame * (Bs.state == BS_ACT && chg ? 0.25f : 0.08f), amp = (Bs.state == BS_CHASE) ? 0.35f : (chg ? 0.6f : 0.1f);
+        uint32_t robe = Bs.flash > 0 ? body : RGB(58, 52, 54), robeD = shade(robe, 0.7f), bone = RGB(214, 204, 186);
+        cur_gy = 0;
+        pb_x = x; pb_z = z; pb_c = c; pb_s = s; pb_rolling = 0; pb_y = y;
+        /* gambe colonnari */
+        TEXS(TX_STONE, 10);
+        for (i = 0; i < 2; i++) {
+            float sd = i ? -6.5f : 6.5f, a1 = sinf(wk + i * PI) * amp;
+            float kf = sinf(a1) * 10 + 1, ku = hip - cosf(a1) * 10;
+            limb_taper = 0.85f;
+            limbL(0, hip, sd, kf, ku, sd * 1.05f, 3.6f, 3.4f, dark);
+            limbL(kf, ku, sd * 1.05f, kf + sinf(a1 - 0.3f) * 10, 1.0f, sd * 1.1f, 2.8f, 2.8f, dark);
+            limb_taper = 1.0f;
+            blobL(kf + 0.5f, ku, sd * 1.05f, 2.8f, 2.6f, 2.8f, body, 4, 8);
+            blobL(kf + sinf(a1 - 0.3f) * 10 + 2, 1.2f, sd * 1.1f, 4.2f, 1.6f, 3.0f, dark, 3, 8);
+        }
+        /* veste a brandelli sotto la cintura */
+        TEXS(TX_CLOTH, 10);
+        for (i = -3; i <= 3; i++) {
+            float sw = sinf(frame * 0.06f + i * 1.3f) * 1.4f, ang2 = i * 0.42f;
+            float bf = cosf(ang2 + PI) * 7.5f, bs = sinf(ang2 + PI) * 9.0f;
+            limbL(bf * 0.6f, hip + 3, bs * 0.6f, bf - 2.0f - sw, 3.0f + (i & 1) * 3.5f, bs * 1.1f, 3.4f, 0.4f, (i & 1) ? robe : robeD);
+        }
+        limb_taper = 1.35f;
+        limbL(0, hip + 4, 0, 0.5f, hip - 8, 0, 9.0f, 7.0f, robe);
+        limb_taper = 1.0f;
+        /* tronco massiccio, curvo in avanti */
         TEXS(TX_STONE, 14);
-        box(x + sx * 15, y + 14, z + sz * 15, 3.5f, 14, 3.5f, ang, body, body, 1, 0);
-        box(shx + cosf(a2) * 12, y + 17, shz + sinf(a2) * 12, 12, 3, 2, a2, dark, dark, 1, 0);
-        box(x - sx * 15 + c * 2, y + 6, z - sz * 15 + s * 2, 3, 20, 3, ang, body, body, 1, 0);
+        limb_taper = 1.45f;
+        limbL(0, hip + 2, 0, lean, shU - 4, 0, 7.5f, 6.0f, body);
+        limb_taper = 1.0f;
+        blobL(lean + 1.5f, shU - 6, 0, 7.0f, 9.0f, 11.0f, body, 6, 12);
+        blobL(lean - 2.5f, shU - 2, 0, 6.0f, 6.0f, 10.0f, dark, 5, 10);          /* gobba */
+        /* crepe di brace sul petto e cuore incandescente */
         TEXS(TX_WHITE, 32);
-        box(shx + cosf(a2) * 33, y + 18, shz + sinf(a2) * 33, 12, 1.4f, 2.4f, a2, ember, RGB(255, 230, 160), 1, 1);
-        glow(shx + cosf(a2) * 33, y + 19, shz + sinf(a2) * 33, 16, rgba(ember, 100));
-        glow(shx + cosf(a2) * 44, y + 19, shz + sinf(a2) * 44, 9, rgba(ember, 120));
-        if (Bs.state == BS_ACT && Bs.atk == BA_SWIPE)
-            fan(x, z, y + 18, 34, 52, ang - 1.8f, ang - 1.8f + 3.6f * (12 - Bs.timer) / 12.0f, rgba(RGB(255, 140, 60), 130), 14);
+        {
+            uint32_t e2 = shade(ember, 0.9f);
+            limbL(lean + 8.0f, shU - 12, 0.5f, lean + 8.4f, shU - 3, -1.5f, 0.45f, 0.3f, e2);
+            limbL(lean + 8.2f, shU - 7, -0.6f, lean + 7.0f, shU - 9, 6.0f, 0.4f, 0.3f, e2);
+            limbL(lean + 8.2f, shU - 6, 0.0f, lean + 6.8f, shU - 4, -6.5f, 0.4f, 0.3f, e2);
+            {
+                V3 hc = L2W(lean + 8.6f, shU - 7, 0);
+                glow(hc.x, hc.y, hc.z, 9 + sinf(frame * 0.15f) * 1.5f, rgba(ember, 200));
+                glow(hc.x, hc.y, hc.z, 22, rgba(ember, 70));
+            }
+        }
+        /* spallacci di pietra con punte d'osso */
+        TEXS(TX_STONE, 12);
+        for (i = 0; i < 2; i++) {
+            float sd = i ? -13.0f : 13.0f;
+            blobL(lean, shU, sd, 5.0f, 4.0f, 4.5f, dark, 5, 9);
+            TEXS(TX_BARK, 6);
+            limb_taper = 0.2f;
+            limbL(lean - 1, shU + 2, sd * 1.05f, lean - 3, shU + 9, sd * 1.25f, 1.2f, 1.2f, bone);
+            limbL(lean + 1, shU + 1, sd * 0.9f, lean + 1, shU + 6, sd * 1.1f, 0.9f, 0.9f, bone);
+            limb_taper = 1.0f;
+            TEXS(TX_STONE, 12);
+        }
+        /* mantello di cenere sulle spalle */
+        TEXS(TX_CLOTH, 10);
+        for (i = -2; i <= 2; i++) {
+            float sw = sinf(frame * 0.05f + i) * 1.6f;
+            limbL(lean - 5, shU + 1, i * 4.5f, lean - 11 - sw, 6.0f + (i & 1) * 4, i * 5.5f, 3.2f, 0.45f, i & 1 ? robe : robeD);
+        }
+        /* testa: maschera di pietra con due fessure e corna ricurve */
+        TEXS(TX_STONE, 10);
+        blobL(lean + 4, shU + 4, 0, 4.0f, 4.6f, 3.8f, dark, 5, 10);
+        blobL(lean + 6.5f, shU + 3.5f, 0, 1.8f, 4.2f, 3.4f, body, 4, 8);           /* volto */
+        TEXS(TX_BARK, 6);
+        for (i = 0; i < 2; i++) {
+            float sd = i ? -1.0f : 1.0f;
+            limb_taper = 0.7f;
+            limbL(lean + 4, shU + 7, sd * 3.0f, lean + 2, shU + 12, sd * 7.5f, 1.4f, 1.4f, bone);
+            limb_taper = 0.25f;
+            limbL(lean + 2, shU + 12, sd * 7.5f, lean - 2.5f, shU + 15, sd * 9.0f, 1.0f, 1.0f, bone);
+            limb_taper = 1.0f;
+        }
+        TEXS(TX_WHITE, 32);
+        {
+            V3 e1 = L2W(lean + 8.4f, shU + 5, 1.4f), e2 = L2W(lean + 8.4f, shU + 5, -1.4f);
+            box(e1.x, e1.y - 0.6f, e1.z, 0.4f, 1.2f, 0.6f, ang, ember, ember, 1, 1);
+            box(e2.x, e2.y - 0.6f, e2.z, 0.4f, 1.2f, 0.6f, ang, ember, ember, 1, 1);
+            glow((e1.x + e2.x) * 0.5f, e1.y, (e1.z + e2.z) * 0.5f, 7, rgba(ember, 170));
+        }
+        /* braccio sinistro: enorme, artigliato */
+        TEXS(TX_STONE, 12);
+        {
+            float sw = sinf(wk) * amp * 4;
+            limbL(lean, shU - 1, -14, lean + 3 + sw, shU - 13, -16, 3.4f, 3.4f, body);
+            limbL(lean + 3 + sw, shU - 13, -16, lean + 6 + sw, hip - 8, -15, 2.8f, 2.8f, body);
+            blobL(lean + 7 + sw, hip - 10, -15, 3.2f, 3.0f, 3.0f, dark, 4, 8);
+            TEXS(TX_BARK, 6);
+            for (i = 0; i < 3; i++) {
+                limb_taper = 0.2f;
+                limbL(lean + 8 + sw, hip - 11, -16 + i * 1.6f, lean + 11 + sw, hip - 15, -16.5f + i * 1.8f, 0.7f, 0.7f, bone);
+                limb_taper = 1.0f;
+            }
+        }
+        /* braccio destro con la grande lama di brace */
+        {
+            float rel, bdx, bdz, hu2, tipU;
+            V3 hand, tip, mid;
+            float a2 = ang + 0.9f;
+            if (Bs.state == BS_WIND && Bs.atk == BA_SWIPE) a2 = ang - 1.8f;
+            if (Bs.state == BS_ACT && Bs.atk == BA_SWIPE) a2 = ang - 1.8f + 3.6f * (12 - Bs.timer) / 12.0f;
+            rel = a2 - ang; bdx = cosf(rel); bdz = sinf(rel);
+            hu2 = shU - 14; tipU = 18;
+            if (slamW) { hu2 = shU + 10; tipU = shU + 34; bdx = 0.3f; bdz = 0.2f; }
+            if (slamA) { hu2 = shU - 10; tipU = 1; bdx = 1; bdz = 0.15f; }
+            TEXS(TX_STONE, 12);
+            limbL(lean, shU - 1, 14, lean + bdx * 6, (shU + hu2) * 0.5f, 14 + bdz * 6, 3.4f, 3.4f, body);
+            limbL(lean + bdx * 6, (shU + hu2) * 0.5f, 14 + bdz * 6, lean + bdx * 11, hu2, 14 + bdz * 11, 2.8f, 2.8f, body);
+            blobL(lean + bdx * 11, hu2, 14 + bdz * 11, 2.8f, 2.8f, 2.8f, dark, 4, 8);
+            hand = L2W(lean + bdx * 11, hu2, 14 + bdz * 11);
+            if (slamW || slamA) tip = L2W(lean + bdx * 11 + bdx * 40, tipU, 14 + bdz * 11 + bdz * 40);
+            else tip = L2W(lean + bdx * 11 + bdx * 44, tipU, 14 + bdz * 11 + bdz * 44);
+            mid = v3(hand.x + (tip.x - hand.x) * 0.15f, hand.y + (tip.y - hand.y) * 0.15f, hand.z + (tip.z - hand.z) * 0.15f);
+            mat_metal = 1; TEXS(TX_METAL, 10);
+            limb_taper = 0.4f;
+            limb(mid, tip, 1.0f, 3.4f, RGB(70, 64, 66));                                   /* lama scura */
+            limb_taper = 1.0f;
+            mat_metal = 0;
+            TEXS(TX_WHITE, 32);
+            limb_taper = 0.3f;
+            limb(v3(mid.x, mid.y + 0.4f, mid.z), v3(tip.x, tip.y + 0.4f, tip.z), 0.5f, 3.7f, ember);   /* filo incandescente */
+            limb_taper = 1.0f;
+            glow(tip.x, tip.y, tip.z, 10, rgba(ember, 140));
+            glow((mid.x + tip.x) * 0.5f, (mid.y + tip.y) * 0.5f, (mid.z + tip.z) * 0.5f, 14, rgba(ember, 90));
+            if (Bs.state == BS_ACT && Bs.atk == BA_SWIPE)
+                fan(x, z, y + 18, 34, 52, ang - 1.8f, ang - 1.8f + 3.6f * (12 - Bs.timer) / 12.0f, rgba(RGB(255, 140, 60), 130), 14);
+        }
     }
     if (Bs.phase) {
         ground_spot(x, z, 50 + (frame % 8), 0.8f, rgba(RGB(255, 90, 30), 90), RB_ADD);
@@ -4564,6 +5241,9 @@ void game_render(void)
     {
         /* telecamera alle spalle con collisione contro gli edifici */
         float want = 62.0f, t, dist, cp = cosf(camPitch), sp = sinf(camPitch);
+#ifdef GAME_DEBUG
+        if (dbg_cam > 0) want = dbg_cam;
+#endif
         float lx, ly, ox = tx, oz = tz;
         if (P.lock != -1 && lock_pos(&lx, &ly)) { ox = tx + (lx - tx) * 0.25f; oz = tz + (ly - tz) * 0.25f; }
         camGY += (ground_h(P.x, P.y) - camGY) * 0.2f;
@@ -4601,6 +5281,15 @@ void game_render(void)
         glow(mx, my, mz, 110, rgba(RGB(90, 110, 160), 80));
         glow(mx, my, mz, 34, rgba(RGB(150, 165, 200), 150));
         glow(mx, my, mz, 18, rgba(RGB(235, 238, 250), 255));
+        /* nuvole basse illuminate dalla luna, che scorrono lente */
+        for (i = 0; i < 9; i++) {
+            float ca = ma + (i - 4) * 0.42f + sinf(frame * 0.0007f + i) * 0.08f;
+            float cd = 300 + (hash2(i, 11) % 60), ch = 120 + (hash2(i, 13) % 70);
+            float cx = eye.x + cosf(ca) * cd, cz = eye.z + sinf(ca) * cd;
+            int near = i >= 3 && i <= 5;
+            glow(cx, eye.y + ch, cz, 70 + (hash2(i, 17) % 40), rgba(near ? RGB(52, 58, 80) : RGB(26, 30, 44), 255));
+            if (near) glow(cx, eye.y + ch - 12, cz, 40, rgba(RGB(60, 66, 92), 255));
+        }
     }
     draw_world(tx + fx * 100, tz + fz * 100);
     draw_blood();
@@ -4631,17 +5320,68 @@ void game_render(void)
         ground_spot(drop.x, drop.y, 16, 0.6f, rgba(RGB(80, 170, 240), 90), RB_ADD);
         cur_gy = 0;
     }
+    rim_on = 1;
     for (i = 0; i < NE; i++) if (E[i].alive) draw_enemy(&E[i]);
+    lo_detail = 0;
     if (Bs.state != BS_OFF || !Bs.dead) draw_boss();
     rb_draw();
     draw_npc();
     draw_player();
+    rim_on = 0;
     for (i = 0; i < MAXPART; i++)
         if (parts[i].life > 0) {
+            uint32_t pc = parts[i].col;
             cur_gy = ground_h(parts[i].x, parts[i].y);
-            glow(parts[i].x, 6 + parts[i].life * 0.4f, parts[i].y, parts[i].life > 12 ? 2.2f : 1.4f, rgba(parts[i].col, 230));
+            if ((pc & 255) < 190 && ((pc >> 8) & 255) < 50) {
+                /* sangue: gocce scure e opache con una scia, non luminose */
+                float sz = parts[i].life > 12 ? 1.3f : 0.9f;
+                splat(parts[i].x, parts[i].h, parts[i].y, sz, rgba(pc, 235));
+                splat(parts[i].x - parts[i].vx * 0.8f, parts[i].h - parts[i].vh * 0.8f, parts[i].y - parts[i].vy * 0.8f, sz * 0.7f, rgba(pc, 170));
+            } else
+                glow(parts[i].x, parts[i].h, parts[i].y, parts[i].life > 12 ? 2.0f : 1.3f, rgba(pc, 230));
         }
     cur_gy = 0;
+    /* pulviscolo nell'aria: braci in citta', cenere fuori, che salgono e ondeggiano attorno al giocatore */
+    {
+        int intown = in_town((int)(P.x / TS), (int)(P.y / TS));
+        cur_gy = 0;
+        for (i = 0; i < 36; i++) {
+            float sx = (float)(hash2(i, 21) % 160) - 80, sz = (float)(hash2(i, 23) % 160) - 80;
+            float sp = 0.08f + (hash2(i, 25) % 10) * 0.012f, life = (float)(((unsigned)frame + hash2(i, 27)) % 400);
+            float px = P.x + sx + sinf(frame * 0.02f + i) * 6, pz = P.y + sz + cosf(frame * 0.017f + i * 1.3f) * 6;
+            float py = ground_h(P.x, P.y) + 2 + life * sp;
+            float fade = life < 40 ? life / 40 : (life > 340 ? (400 - life) / 60 : 1);
+            int a = (int)(fade * (intown ? 200 : 120));
+            if (py > ground_h(P.x, P.y) + 60) continue;
+            glow(px, py, pz, intown ? 0.9f : 0.7f, rgba(intown ? RGB(255, 140, 60) : RGB(150, 150, 160), a));
+        }
+    }
+    if (shockT > 0) {
+        float k = shockT / 16.0f, r0 = (1 - k) * 34, gh2 = ground_h(shockX, shockY);
+        cur_gy = gh2;
+        fan(shockX, shockY, 0.8f, r0, r0 + 3 + 3 * k, 0, 2 * PI, rgba(RGB(255, 170, 90), (int)(200 * k)), 20);
+        ground_spot(shockX, shockY, 22 + (1 - k) * 18, 1, rgba(RGB(255, 120, 40), (int)(150 * k)), RB_ADD);
+        cur_gy = 0;
+    }
+    /* lampo d'impatto: stella di raggi additivi rivolta alla camera */
+    for (i = 0; i < 6; i++)
+        if (hfx[i].t > 0) {
+            float k = hfx[i].t / 9.0f, gy = ground_h(hfx[i].x, hfx[i].y) + hfx[i].h, len = 4 + (1 - k) * 9, w = 0.5f * k + 0.15f;
+            int r;
+            uint32_t cc = RGB((int)(255 * k), (int)(220 * k), (int)(170 * k));
+            cur_gy = 0;
+            glow(hfx[i].x, gy, hfx[i].y, 3 + 5 * k, rgba(RGB(255, 210, 160), 200));
+            for (r = 0; r < 6; r++) {
+                float a = r * 1.047f + i * 0.7f, ca = cosf(a), sa = sinf(a);
+                float dx2 = camR.x * ca + camU.x * sa, dy2 = camR.y * ca + camU.y * sa, dz2 = camR.z * ca + camU.z * sa;
+                float px = -camR.x * sa + camU.x * ca, py = -camR.y * sa + camU.y * ca, pz = -camR.z * sa + camU.z * ca;
+                float r0 = 1.0f + (1 - k) * 3, r1 = r0 + len * ((r & 1) ? 0.6f : 1.0f);
+                V3 q0 = v3(hfx[i].x + dx2 * r0 + px * w, gy + dy2 * r0 + py * w, hfx[i].y + dz2 * r0 + pz * w);
+                V3 q1 = v3(hfx[i].x + dx2 * r0 - px * w, gy + dy2 * r0 - py * w, hfx[i].y + dz2 * r0 - pz * w);
+                V3 q2 = v3(hfx[i].x + dx2 * r1, gy + dy2 * r1, hfx[i].y + dz2 * r1);
+                emit_quad(q0, q1, q2, q2, cc, cc, 0, 0, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, TX_WHITE, RB_ADD);
+            }
+        }
     {
         float lx, ly;
         if (P.lock != -1 && lock_pos(&lx, &ly)) {
@@ -4741,6 +5481,12 @@ static void teleport_w(int wx, int wy)
     move_window(wx - MW / 2, wy - MH / 2);
     P.x = (wx - WX0) * TS + 8; P.y = (wy - WY0) * TS + 8;
     camX = P.x; camZ = P.y;
+}
+void game_debug_boss(void)
+{
+    embers = 4; P.iframes = 100000;
+    if (Bs.state == BS_OFF) { Bs.state = BS_CHASE; Bs.timer = 0; }
+    P.x = Bs.x - 75; P.y = Bs.y; P.fx = 1; P.fy = 0; camX = P.x; camZ = P.y; camYaw = 0;
 }
 void game_debug_teleport(int where)
 {
