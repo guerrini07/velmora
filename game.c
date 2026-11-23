@@ -49,7 +49,7 @@ static int gate_closed;
 float dbg_cam;
 int dbg_noen, dbg_nopl;
 #endif
-static float camYaw = -PI / 2, camX, camZ, camPitch = 0.36f, camDistS = 62.0f;
+static float camYaw = -PI / 2, camX, camZ, camPitch = 0.36f, camDistS = 34.0f;
 static int lTap, lUsed;
 static float camGY;
 static int menuSel;
@@ -64,13 +64,13 @@ typedef struct {
 } EKind;
 static const EKind EK[4] = {
     /* Reietto: veloce e fragile */
-    { 70, 1.05f, 22.0f, 30, 18, 34, 60, 0, 7.0f },
+    { 70, 0.62f, 12.5f, 30, 18, 34, 60, 0, 3.9f },
     /* Lanciere: lento, lungo raggio, non si scompone con gli attacchi leggeri */
-    { 120, 0.80f, 34.0f, 42, 26, 40, 110, 1, 8.0f },
+    { 120, 0.48f, 19.0f, 42, 26, 40, 110, 1, 4.4f },
     /* Lupo cinereo: rapidissimo, balzo in avanti */
-    { 60, 1.6f, 20.0f, 22, 16, 26, 70, 0, 6.5f },
+    { 60, 0.95f, 11.5f, 22, 16, 26, 70, 0, 3.6f },
     /* Colosso di pietra: lento, colpi devastanti, non si scompone */
-    { 320, 0.7f, 34.0f, 52, 42, 52, 450, 1, 11.0f },
+    { 320, 0.42f, 19.0f, 52, 42, 52, 450, 1, 6.0f },
 };
 
 /* coordinate del mondo (caselle) e tipo di nemico */
@@ -103,6 +103,7 @@ typedef struct {
     float x, y, fx, fy;
     int kind, hp, state, timer, alive, flash, hitBy, hitDone, deadT, id;
     float kvx, kvy, az, avz, tilt;   /* spinta del colpo, altezza in volo, inclinazione del corpo */
+    float bw, bs, bg, bm, wph;       /* pose sfumate: carica, colpo, barcollare, camminata; fase del passo */
     int air;
 } Enemy;
 static Enemy E[MAXE];
@@ -204,6 +205,11 @@ enum { TRMAX = 18 };
 static int trN;   /* scia della lama */
 static void rb_draw(void);
 static void draw_npc(void);
+static void room_interact(const Input *in);
+static int door_near(float *ox, float *oy, unsigned *id);
+static void room_enter(unsigned id, float ox, float oy);
+static void open_map(void);
+static void draw_room(void);
 static int near_npc(void);
 static void npc_talk(void);
 static int load_game(void);
@@ -288,6 +294,22 @@ static int in_arena(float x, float y)
     int kx = (int)floorf(x / TS) + WX0 - COREX, ky = (int)floorf(y / TS) + WY0 - COREY;
     return kx >= CX0 + 67 && kx <= CX0 + 90 && ky >= CY0 + 26 && ky <= CY0 + 46;
 }
+/* ---- interni: stanze in cui si entra dalle porte delle case ---- */
+#define RW 7
+#define RH 6
+#define RCEIL 44.0f
+static int inRoom, roomType;
+static unsigned roomId;
+static float roomOutX, roomOutY, roomOutYaw;
+static unsigned char rgrid[RH][RW];
+static int roomChestX = -1, roomChestY = -1, roomChestOpen;
+static unsigned openedChests[48]; static int nOpened;
+typedef struct { float x, y, z, R, s, r, g, b; } RLight;
+static RLight rl[12]; static int nrl;
+/* meta sulla mappa (coordinate del mondo in caselle) */
+static int wpOn, wpX, wpY;
+static int room_solid(int tx, int ty) { if (tx < 0 || ty < 0 || tx >= RW || ty >= RH) return 1; return rgrid[ty][tx] != 0; }
+
 static int tile_solid(int t)
 {
     return t == T_WALL || t == T_GRAVE || t == T_CRATE || t == T_TREE || t == T_FIRE ||
@@ -295,6 +317,7 @@ static int tile_solid(int t)
 }
 static int solid(int tx, int ty)
 {
+    if (inRoom) return room_solid(tx, ty);
     if (tx < 0 || ty < 0 || tx >= MW || ty >= MH) return 1;
     if (tile_solid(map[ty][tx])) return 1;
     if (map[ty][tx] == T_GATE) return gate_closed;
@@ -388,6 +411,7 @@ static float height_at(int wx, int wy)
 #define MAPC (WORLDT / MAPN)
 static uint32_t wmapc[MAPN][MAPN];
 static int mapZoom, map_ready;
+static float mapCurX, mapCurY;
 static char regionName[28] = "VELMORA";
 static const char *region_name_now(void) { return regionName; }
 static uint32_t map_height_col(float h, float hl, float hu)
@@ -848,6 +872,7 @@ static void build_map(void) { build_region(0, 0, MW - 1, MH - 1); }
 /* altezza del terreno in un punto (coordinate locali in unita') */
 static float ground_h(float x, float z)
 {
+    if (inRoom) return 0;
     float fx = x / TS, fz = z / TS, ax, az;
     int tx = (int)floorf(fx), tz = (int)floorf(fz);
     if (tx < 0 || tz < 0 || tx >= MW || tz >= MH) return 0;
@@ -917,7 +942,7 @@ static void spawn_parts(float x, float y, int n, uint32_t col, float spd)
             parts[i].vx = cosf(a) * s; parts[i].vy = sinf(a) * s;
             parts[i].life = 14 + (int)(rnd() % 14);
             parts[i].col = col;
-            parts[i].h = 7 + frnd() * 6; parts[i].vh = 0.6f + frnd() * 1.4f;   /* arco balistico */
+            parts[i].h = 4 + frnd() * 3.5f; parts[i].vh = 0.45f + frnd() * 1.0f;   /* arco balistico */
             n--;
         }
 }
@@ -1102,6 +1127,7 @@ static void move_window(int nx0, int ny0)
 /* tiene il giocatore vicino al centro della finestra */
 static void keep_centered(void)
 {
+    if (inRoom) return;
     int px = (int)(P.x / TS), py = (int)(P.y / TS);
     if (px < 80 || px > MW - 80 || py < 80 || py > MH - 80)
         move_window(WX0 + px - MW / 2, WY0 + py - MH / 2);
@@ -1109,6 +1135,7 @@ static void keep_centered(void)
 
 static void respawn(void)
 {
+    inRoom = 0; nrl = 0;
     Brazier *b = &braz[cpB];
     int lx = b->tx - WX0, ly = b->ty - WY0;
     if (lx < 64 || lx > MW - 64 || ly < 64 || ly > MH - 64) {
@@ -1189,7 +1216,7 @@ static void hurt_player(int dmg, float sx, float sy)
     }
     P.state = PS_HURT; P.timer = 0;
     sfx(SFX_HURT);
-    P.kx = dx / d * 3.0f; P.ky = dy / d * 3.0f;
+    P.kx = dx / d * 1.7f; P.ky = dy / d * 1.7f;
     P.iframes = 22;
 }
 
@@ -1198,8 +1225,8 @@ static void hurt_player(int dmg, float sx, float sy)
 /* ------------------------------------------------------------------ */
 enum { AT_L1, AT_HEAVY, AT_L2, AT_L3, AT_RUN };
 static const int AW[5] = { 7, 16, 6, 8, 7 }, AA[5] = { 6, 6, 6, 9, 7 }, AR[5] = { 12, 20, 12, 18, 16 };
-static const float ASTEP[5] = { 1.7f, 1.8f, 1.7f, 2.6f, 3.6f };    /* avanzamento durante il colpo */
-static const float ARANGE[5] = { 33, 40, 33, 34, 36 };
+static const float ASTEP[5] = { 0.95f, 1.0f, 0.95f, 1.45f, 2.0f };    /* avanzamento durante il colpo */
+static const float ARANGE[5] = { 19, 23, 19, 20, 21 };
 static const float ADMG[5] = { 1.0f, 1.0f, 1.05f, 1.45f, 1.3f };
 static const int ACOST[5] = { 15, 30, 14, 20, 22 };
 static int hitstop;      /* congelamento di qualche frame quando un colpo va a segno */
@@ -1223,27 +1250,27 @@ static void player_hits(void)
             e->flash = 6;
             spawn_parts(e->x, e->y, 16, RGB(120, 8, 14), 2.6f);
             spawn_parts(e->x - dx / d * 4, e->y - dy / d * 4, 5, RGB(255, 190, 110), 3.0f);
-            spawn_hitfx(e->x - dx / d * 4, e->y - dy / d * 4, EK[e->kind].r > 9 ? 16.0f : 11.0f);
+            spawn_hitfx(e->x - dx / d * 2.5f, e->y - dy / d * 2.5f, (EK[e->kind].r > 5 ? 9.0f : 6.5f) + e->az);
             sfx(SFX_HIT);
             hitstop = P.atk == AT_HEAVY ? 6 : 3;
             add_blood(e->x + dx / d * 6, e->y + dy / d * 6, 2.5f + frnd() * 3);
-            spawn_puff(e->x - dx / d * 2, e->y - dy / d * 2, (EK[e->kind].r > 9 ? 14.0f : 9.0f) + e->az, P.atk == AT_HEAVY ? 7.0f : 5.0f);
+            spawn_puff(e->x - dx / d * 1.2f, e->y - dy / d * 1.2f, (EK[e->kind].r > 5 ? 8.0f : 5.5f) + e->az, P.atk == AT_HEAVY ? 4.0f : 3.0f);
             comboN++; comboT = 110;
             if (comboN > comboBest) comboBest = comboN;
             {
                 /* reazione al colpo: spinta, e i nemici leggeri vengono lanciati in aria dal colpo pesante */
-                float kb = P.atk == AT_HEAVY ? 2.6f : (P.atk == AT_L3 ? 3.2f : (P.atk == AT_RUN ? 2.4f : 1.5f));
+                float kb = P.atk == AT_HEAVY ? 1.45f : (P.atk == AT_L3 ? 1.75f : (P.atk == AT_RUN ? 1.3f : 0.85f));
                 int light = e->kind < 2;
                 if (EK[e->kind].poise && P.atk != AT_HEAVY) kb *= 0.4f;
                 e->kvx = dx / d * kb; e->kvy = dy / d * kb;
-                if (e->air) { e->avz = 1.6f; e->kvx *= 0.4f; e->kvy *= 0.4f; }          /* giocoleria in aria */
-                else if (light && (P.atk == AT_HEAVY || (P.atk == AT_L3 && e->kind == 0))) { e->air = 1; e->avz = P.atk == AT_HEAVY ? 3.8f : 2.4f; }
+                if (e->air) { e->avz = 1.15f; e->kvx *= 0.4f; e->kvy *= 0.4f; }          /* giocoleria in aria */
+                else if (light && (P.atk == AT_HEAVY || (P.atk == AT_L3 && e->kind == 0))) { e->air = 1; e->avz = P.atk == AT_HEAVY ? 2.7f : 1.75f; }
                 e->tilt = e->air ? -0.5f : -0.25f;
             }
             if (e->hp <= 0) {
                 e->state = ES_DEAD; e->deadT = 60;
-                e->kvx = dx / d * 3.2f; e->kvy = dy / d * 3.2f;
-                if (e->kind < 2) { e->air = 1; e->avz = 2.6f + (P.atk == AT_HEAVY ? 1.5f : 0); }
+                e->kvx = dx / d * 1.75f; e->kvy = dy / d * 1.75f;
+                if (e->kind < 2) { e->air = 1; e->avz = 1.9f + (P.atk == AT_HEAVY ? 1.1f : 0); }
                 mark_killed(e->id);
                 sfx(SFX_EDEATH);
                 P.frags += EK[e->kind].reward;
@@ -1319,7 +1346,7 @@ static int near_brazier(void)
     int i;
     for (i = 0; i < nbraz; i++) {
         float dx = (braz[i].tx - WX0) * TS + 8 - P.x, dy = (braz[i].ty - WY0) * TS + 8 - P.y;
-        if (dx * dx + dy * dy < 28 * 28) return i;
+        if (dx * dx + dy * dy < 22 * 22) return i;
     }
     return -1;
 }
@@ -1396,7 +1423,7 @@ static void player_update(const Input *in)
     if (act) { P.buf = act; P.bufT = 12; }
     else if (P.bufT > 0 && --P.bufT == 0) P.buf = 0;
 
-    if (in->pressed & B_R) P.lock = (P.lock == -1) ? find_lock_target() : -1;
+    if ((in->pressed & B_R) && !inRoom) P.lock = (P.lock == -1) ? find_lock_target() : -1;
     if (P.lock != -1 && !lock_pos(&lx, &ly)) P.lock = -1;
     locked = P.lock != -1 && lock_pos(&lx, &ly);
 
@@ -1417,12 +1444,12 @@ static void player_update(const Input *in)
     switch (P.state) {
     case PS_FREE: {
         /* movimento con accelerazione e frenata morbide */
-        float sp = P.sprint ? 2.8f : 1.8f, k = ml > 0 ? 0.28f : 0.22f;
+        float sp = P.sprint ? 1.6f : 1.0f, k = ml > 0 ? 0.24f : 0.2f;
         float tvx = mx * sp * ml, tvy = my * sp * ml;
         P.vx += (tvx - P.vx) * k; P.vy += (tvy - P.vy) * k;
         if (fabsf(P.vx) + fabsf(P.vy) > 0.02f) {
-            move_circle(&P.x, &P.y, 6, P.vx, P.vy);
-            P.walk += sqrtf(P.vx * P.vx + P.vy * P.vy) * 0.17f;
+            move_circle(&P.x, &P.y, 3.5f, P.vx, P.vy);
+            P.walk += sqrtf(P.vx * P.vx + P.vy * P.vy) * 0.3f;
         }
         if (ml > 0 && (!locked || P.sprint)) turn_towards(mx, my, P.sprint ? 0.22f : 0.3f);
         if (P.sprint && frame % 6 == 0) spawn_parts(P.x - P.fx * 4, P.y - P.fy * 4, 2, RGB(120, 112, 104), 0.5f);
@@ -1446,13 +1473,13 @@ static void player_update(const Input *in)
         /* avanzamento: spinta in avanti che cresce nella carica e si esaurisce nel colpo */
         if (P.timer > W - 3 && P.timer <= W + A) {
             stepk = 1.0f - (float)(P.timer - (W - 3)) / (A + 3);
-            move_circle(&P.x, &P.y, 6, P.fx * ASTEP[P.atk] * (0.4f + stepk), P.fy * ASTEP[P.atk] * (0.4f + stepk));
+            move_circle(&P.x, &P.y, 3.5f, P.fx * ASTEP[P.atk] * (0.4f + stepk), P.fy * ASTEP[P.atk] * (0.4f + stepk));
         }
         if (P.timer > W && P.timer <= W + A) player_hits();
         if (P.timer == W + A && (P.atk == AT_HEAVY || P.atk == AT_L3 || P.atk == AT_RUN)) shake = 5;
         if (P.atk == AT_HEAVY && P.timer == W + A - 2) {
             /* la lama colpisce il terreno: onda d'urto, polvere e scintille */
-            shockX = P.x + P.fx * 20; shockY = P.y + P.fy * 20; shockT = 16;
+            shockX = P.x + P.fx * 12; shockY = P.y + P.fy * 12; shockT = 16;
             shake = 9 + (int)(P.charge / 5);
             spawn_parts(shockX, shockY, 14, RGB(170, 160, 150), 2.6f);
             spawn_parts(shockX, shockY, 8, RGB(255, 170, 90), 3.2f);
@@ -1477,10 +1504,10 @@ static void player_update(const Input *in)
          * Senza direzione: saltello all'indietro, piu' breve */
         int dur = P.backstep ? 13 : 22;
         float t = (float)P.timer / dur, s;
-        s = P.backstep ? 3.4f * (1 - t) : (t < 0.1f ? 4.6f : (t < 0.68f ? 4.2f * (1 - (t - 0.1f) * 0.9f) : 2.3f * (1 - t) / 0.32f));
+        s = P.backstep ? 1.9f * (1 - t) : (t < 0.1f ? 2.5f : (t < 0.68f ? 2.3f * (1 - (t - 0.1f) * 0.9f) : 1.3f * (1 - t) / 0.32f));
         P.timer++;
         if (P.timer == 2) P.iframes = P.backstep ? 7 : 13;
-        move_circle(&P.x, &P.y, 6, P.rx * s, P.ry * s);
+        move_circle(&P.x, &P.y, 3.5f, P.rx * s, P.ry * s);
         if (!P.backstep && (P.timer == 3 || P.timer == 9 || P.timer == 15)) spawn_parts(P.x, P.y, P.timer == 15 ? 6 : 3, RGB(120, 112, 104), 0.8f);
         P.vx = P.rx * 0.8f; P.vy = P.ry * 0.8f;
         if (P.timer >= dur - 4 && P.buf && !(P.buf & B_CROSS)) {
@@ -1496,7 +1523,7 @@ static void player_update(const Input *in)
     }
     case PS_HEAL:
         P.timer++;
-        if (ml > 0) move_circle(&P.x, &P.y, 6, mx * 0.45f, my * 0.45f);
+        if (ml > 0) move_circle(&P.x, &P.y, 3.5f, mx * 0.28f, my * 0.28f);
         if (P.timer == 26) {
             P.flasks--;
             P.hp += maxhp() * 0.45f;
@@ -1509,13 +1536,14 @@ static void player_update(const Input *in)
         break;
     case PS_HURT:
         P.timer++;
-        move_circle(&P.x, &P.y, 6, P.kx, P.ky);
+        move_circle(&P.x, &P.y, 3.5f, P.kx, P.ky);
         P.kx *= 0.8f; P.ky *= 0.8f;
         if (P.timer >= 8 && (P.buf & B_CROSS)) { P.state = PS_FREE; start_action(B_CROSS, mx, my, ml); }   /* rialzarsi rotolando */
         else if (P.timer >= 16) P.state = PS_FREE;
         break;
     default: break;
     }
+    if (inRoom) { room_interact(in); return; }
 
     /* recupero frammenti */
     if (drop.active) {
@@ -1587,7 +1615,11 @@ static void player_update(const Input *in)
             sfx(SFX_BRAZIER);
             save_game();
         } else if (b < 0 && near_npc() && P.state == PS_FREE) npc_talk();
-        else if (b < 0) { mode = M_MAP; mapZoom = 0; }       /* lontano da bracieri e persone: mappa */
+        else if (b < 0) {
+            float ox, oy; unsigned did;
+            if (P.state == PS_FREE && door_near(&ox, &oy, &did)) room_enter(did, ox, oy);
+            else open_map();       /* lontano da bracieri, persone e porte: mappa */
+        }
     }
 }
 
@@ -1622,6 +1654,14 @@ static void enemies_update(void)
             } else if (e->state != ES_DEAD) { e->state = ES_STAG; if (e->timer < 4) e->timer = 4; }
         } else if (e->state != ES_DEAD) e->tilt *= 0.8f;
         if (e->state == ES_DEAD) { if (--e->deadT <= 0) e->alive = 0; continue; }
+        {   /* le pose si raggiungono in qualche fotogramma: niente scatti tra un'azione e l'altra */
+            float tw = e->state == ES_WIND, ts = e->state == ES_STRIKE, tg = e->state == ES_STAG, tm = e->state == ES_CHASE;
+            e->bw += (tw - e->bw) * (tw > e->bw ? 0.16f : 0.3f);
+            e->bs += (ts - e->bs) * (ts > e->bs ? 0.55f : 0.14f);
+            e->bg += (tg - e->bg) * 0.35f;
+            e->bm += (tm - e->bm) * 0.15f;
+            if (e->state == ES_CHASE) e->wph += k->speed * 0.55f;
+        }
         if (e->flash > 0) e->flash--;
         dx = P.x - e->x; dy = P.y - e->y; d = sqrtf(dx * dx + dy * dy) + 0.001f;
         switch (e->state) {
@@ -1639,11 +1679,11 @@ static void enemies_update(void)
             if (--e->timer <= 0) { e->state = ES_STRIKE; e->timer = 9; e->hitDone = 0; }
             break;
         case ES_STRIKE:
-            move_circle(&e->x, &e->y, k->r, e->fx * 2.0f, e->fy * 2.0f);
+            move_circle(&e->x, &e->y, k->r, e->fx * 1.1f, e->fy * 1.1f);
             if (!e->hitDone && e->timer <= 7) {
                 float ex = P.x - e->x, ey = P.y - e->y, ed = sqrtf(ex * ex + ey * ey) + 0.001f;
                 e->hitDone = 1;
-                if (ed < k->range + 10 && (ex * e->fx + ey * e->fy) / ed > 0.2f) hurt_player(k->dmg, e->x, e->y);
+                if (ed < k->range + 5.5f && (ex * e->fx + ey * e->fy) / ed > 0.2f) hurt_player(k->dmg, e->x, e->y);
             }
             if (--e->timer <= 0) { e->state = ES_REC; e->timer = k->rec; }
             break;
@@ -1653,7 +1693,7 @@ static void enemies_update(void)
             break;
         }
         /* non si sovrappongono al giocatore */
-        if (d < k->r + 6) move_circle(&e->x, &e->y, k->r, -dx / d * (k->r + 6 - d), -dy / d * (k->r + 6 - d));
+        if (d < k->r + 3.5f) move_circle(&e->x, &e->y, k->r, -dx / d * (k->r + 3.5f - d), -dy / d * (k->r + 3.5f - d));
     }
     for (i = 0; i < NE; i++)
         for (j = i + 1; j < NE; j++) {
@@ -1786,7 +1826,7 @@ static void boss_update(void)
     }
     /* il corpo del boss spinge il giocatore */
     dx = P.x - Bs.x; dy = P.y - Bs.y; d = sqrtf(dx * dx + dy * dy) + 0.001f;
-    if (Bs.z < 6 && d < 24) move_circle(&P.x, &P.y, 6, dx / d * (24 - d), dy / d * (24 - d));
+    if (Bs.z < 6 && d < 24) move_circle(&P.x, &P.y, 3.5f, dx / d * (24 - d), dy / d * (24 - d));
 }
 
 static void rb_center(int i, float *x, float *y)
@@ -2022,7 +2062,7 @@ static void rb_update(void)
         }
         /* il corpo del boss spinge il giocatore */
         dx = P.x - b->x; dy = P.y - b->y; d = sqrtf(dx * dx + dy * dy) + 0.001f;
-        if (b->z < 6 && d < D->body + 6) move_circle(&P.x, &P.y, 6, dx / d * (D->body + 6 - d), dy / d * (D->body + 6 - d));
+        if (b->z < 6 && d < D->body + 6) move_circle(&P.x, &P.y, 3.5f, dx / d * (D->body + 6 - d), dy / d * (D->body + 6 - d));
     }
 }
 
@@ -2266,7 +2306,7 @@ static const char *talk_a, *talk_b;
 /* la Guardiana vicino al primo braciere */
 static float npc_x(void) { return (CX0 + 9 + COREX - WX0) * TS + 8.0f; }
 static float npc_y(void) { return (CY0 + 5 + COREY - WY0) * TS + 8.0f; }
-static int near_npc(void) { float dx = npc_x() - P.x, dy = npc_y() - P.y; return dx * dx + dy * dy < 36 * 36; }
+static int near_npc(void) { float dx = npc_x() - P.x, dy = npc_y() - P.y; return dx * dx + dy * dy < 34 * 34; }
 
 static void npc_talk(void)
 {
@@ -2407,9 +2447,11 @@ void game_update(const Input *in)
         keep_centered();
         if (mode != M_PLAY) break;
         if (hitstop > 0) { hitstop--; break; }
-        enemies_update();
-        boss_update();
-        rb_update();
+        if (!inRoom) {
+            enemies_update();
+            boss_update();
+            rb_update();
+        }
         playtime++;
         break;
     case M_DEAD:
@@ -2418,11 +2460,28 @@ void game_update(const Input *in)
         break;
     case M_PAUSE:
         if (in->pressed & (B_START | B_CIRCLE)) mode = M_PLAY;
-        if (in->pressed & B_SQUARE) { mode = M_MAP; mapZoom = 0; }
+        if (in->pressed & B_SQUARE) open_map();
         break;
     case M_MAP:
-        if (in->pressed & (B_SELECT | B_START | B_CIRCLE | B_CROSS)) mode = M_PLAY;
-        if (in->pressed & (B_TRIANGLE | B_SQUARE)) mapZoom ^= 1;
+        if (in->pressed & (B_SELECT | B_START | B_CIRCLE)) mode = M_PLAY;
+        if (in->pressed & (B_TRIANGLE | B_SQUARE)) { mapZoom ^= 1; mapCurX = P.x / TS + WX0; mapCurY = P.y / TS + WY0; }
+        {   /* cursore: levetta o croce; X mette o toglie la meta */
+            float sx = in->ax, sy = in->ay, sp = mapZoom ? 1.6f : 26.0f;
+            if (in->held & B_LEFT) sx = -1;
+            if (in->held & B_RIGHT) sx = 1;
+            if (in->held & B_UP) sy = -1;
+            if (in->held & B_DOWN) sy = 1;
+            if (sx * sx + sy * sy > 0.02f) { mapCurX += sx * sp; mapCurY += sy * sp; }
+            if (mapCurX < 0) mapCurX = 0;
+            if (mapCurY < 0) mapCurY = 0;
+            if (mapCurX > WORLDT - 1) mapCurX = WORLDT - 1;
+            if (mapCurY > WORLDT - 1) mapCurY = WORLDT - 1;
+            if (in->pressed & B_CROSS) {
+                int cx = (int)mapCurX, cy = (int)mapCurY;
+                if (wpOn && (cx - wpX) * (cx - wpX) < (mapZoom ? 9 : 3600) && (cy - wpY) * (cy - wpY) < (mapZoom ? 9 : 3600)) { wpOn = 0; sfx(SFX_MENU); }
+                else { wpOn = 1; wpX = cx; wpY = cy; sfx(SFX_SELECT); }
+            }
+        }
         break;
     case M_MENU:
         if (in->pressed & B_UP) menuSel = (menuSel + 3) % 4;
@@ -2627,7 +2686,7 @@ static void material(int t, float u, float v, int x, int y, float *h, float *r, 
         int pi = (int)floorf(pl);
         float kx = (hashf(pi, 0, 7) * 0.6f + 0.2f), ky = hashf(pi, 1, 8);
         float dk = sqrtf((fx - kx) * (fx - kx) * 16 + (v - ky) * (v - ky) * 4);
-        float gr = sinf(v * 60 + fbp(u, v, 4, 15, 3) * 10 + pi * 3 + 3.0f / (dk + 0.3f));
+        float gr = sinf(v * 60 + fbp(u, v, 4, 15, 3) * 6 + pi * 3 + (dk < 0.35f ? 1.2f / (dk + 0.25f) : 0));
         n = fbp(u, v, 32, 19, 2);
         *h = (fx < 0.04f || fx > 0.96f) ? 0.1f : 0.75f + 0.12f * gr + 0.1f * n;
         { float c = 0.36f + 0.1f * gr + 0.12f * hashf(pi, 2, 5) + 0.08f * (n - 0.5f); *r = c; *g = c * 0.8f; *b = c * 0.62f; }
@@ -2842,6 +2901,24 @@ static Lt light_point(float wx, float wz, float ao)
     float fx = (wx - 8) / TS, fz = (wz - 8) / TS, ax, az, dx, dz, k, w[4];
     int tx = (int)floorf(fx), tz = (int)floorf(fz), i;
     Lt l = { 0.17f, 0.20f, 0.31f };
+    if (inRoom) {
+        /* interno: penombra calda, candele e camino che tremolano, lanterna del cavaliere */
+        l.r = 0.12f; l.g = 0.12f; l.b = 0.16f;     /* penombra con un filo di luna dalle finestre */
+        for (i = 0; i < nrl; i++) {
+            float ddx = wx - rl[i].x, ddz = wz - rl[i].z, d = sqrtf(ddx * ddx + ddz * ddz), kk;
+            if (d >= rl[i].R) continue;
+            kk = 1 - d / rl[i].R; kk = kk * kk * rl[i].s * (0.9f + 0.1f * sinf(frame * 0.23f + i * 2.1f) * sinf(frame * 0.071f + i));
+            l.r += kk * rl[i].r; l.g += kk * rl[i].g; l.b += kk * rl[i].b;
+        }
+        dx = wx - P.x; dz = wz - P.y;
+        k = 1 - sqrtf(dx * dx + dz * dz) / 60.0f;
+        if (k > 0) { k *= k; l.r += k * 0.45f; l.g += k * 0.34f; l.b += k * 0.2f; }
+        l.r *= ao; l.g *= ao; l.b *= ao;
+        if (l.r > 1.3f) l.r = 1.3f;
+        if (l.g > 1.2f) l.g = 1.2f;
+        if (l.b > 1.2f) l.b = 1.2f;
+        return l;
+    }
     if (endingSeen) { l.r = 0.36f; l.g = 0.30f; l.b = 0.30f; }   /* luce dell'alba */
     ax = fx - tx; az = fz - tz;
     w[0] = (1 - ax) * (1 - az); w[1] = ax * (1 - az); w[2] = (1 - ax) * az; w[3] = ax * az;
@@ -3047,6 +3124,8 @@ static int pb_rolling;
 /* colonna vertebrale del personaggio: torsione del busto, peso spostato sui fianchi, spalle inclinate.
  * i piedi restano fermi a terra, il busto ruota, la testa compensa e resta piu' stabile */
 static int pb_body;
+#define CS 0.55f          /* scala dei personaggi rispetto al mondo (porte, case, alberi) */
+static float pb_sc = 1;   /* scala del modello in disegno */
 static float pb_rollC = 1, pb_rollF;   /* compressione e centro della capriola */
 static float pb_tw, pb_sway, pb_tilt, pb_bank, pb_hipU = 11, pb_shU = 17.4f, pb_wover = -9;
 static void body_bend(float *lf, float lu, float *ls)
@@ -3073,7 +3152,7 @@ static V3 L2W(float lf, float lu, float ls)
         lu = 6.2f + (-df * sa + du * ca);
         if (lu < 0.3f) lu = 0.3f;
     }
-    return v3(pb_x + pb_c * lf - pb_s * ls, lu + pb_y, pb_z + pb_s * lf + pb_c * ls);
+    return v3(pb_x + (pb_c * lf - pb_s * ls) * pb_sc, lu * pb_sc + pb_y, pb_z + (pb_s * lf + pb_c * ls) * pb_sc);
 }
 
 /* --- forme arrotondate per il corpo --- */
@@ -3144,6 +3223,7 @@ static float limb_bulge;   /* rigonfiamento a meta' (muscoli, piastre bombate) *
 static int caps_near;      /* nemici vicini: anche loro con forme arrotondate */
 static void limb(V3 a, V3 b, float w, float d, uint32_t col)
 {
+    w *= pb_sc; d *= pb_sc;
     float ax = b.x - a.x, ay = b.y - a.y, az = b.z - a.z, len = sqrtf(ax * ax + ay * ay + az * az) + 0.0001f;
     float rx = -pb_s, rz = pb_c, dp, sx, sy, sz, sl, fx, fy, fz, tp = limb_taper;
     int seg = lo_detail ? 5 : (w + d > 1.5f) ? (hi_detail ? 12 : 9) : ((w + d > 0.6f) ? (hi_detail ? 9 : 7) : (hi_detail ? 5 : 4)), k, tex = cur_tex;
@@ -3405,20 +3485,20 @@ static void draw_building(int tx, int ty, unsigned h, int cut)
         if (hw % 6 == 0) {
             float dx2 = cx + fx * 8.2f, dz2 = cz + fz * 8.2f;
             TEXS(TX_STONE, 10);
-            box(dx2, 0, dz2, yaw == 0 ? 3.6f : 0.5f, 12, yaw == 0 ? 0.5f : 3.6f, 0, trim, trim, 1, 0);
-            box(cx + fx * 9.6f, 0, cz + fz * 9.6f, yaw == 0 ? 4.2f : 1.6f, 0.6f, yaw == 0 ? 1.6f : 4.2f, 0, RGB(96, 92, 96), RGB(110, 106, 110), 1, 0);
+            box(dx2, 0, dz2, yaw == 0 ? 4.4f : 0.5f, 16, yaw == 0 ? 0.5f : 4.4f, 0, trim, trim, 1, 0);
+            box(cx + fx * 9.6f, 0, cz + fz * 9.6f, yaw == 0 ? 5.0f : 1.6f, 0.6f, yaw == 0 ? 1.6f : 5.0f, 0, RGB(96, 92, 96), RGB(110, 106, 110), 1, 0);
             TEXS(TX_WOOD, 8);
-            box(cx + fx * 8.65f, 0.6f, cz + fz * 8.65f, yaw == 0 ? 2.7f : 0.25f, 9.2f, yaw == 0 ? 0.25f : 2.7f, 0, RGB(110, 76, 52), RGB(110, 76, 52), 1, 0);
-            box(cx + fx * 8.65f, 9.8f, cz + fz * 8.65f, yaw == 0 ? 1.8f : 0.25f, 1.2f, yaw == 0 ? 0.25f : 1.8f, 0, RGB(110, 76, 52), RGB(110, 76, 52), 1, 0);
+            box(cx + fx * 8.65f, 0.6f, cz + fz * 8.65f, yaw == 0 ? 3.4f : 0.25f, 13.2f, yaw == 0 ? 0.25f : 3.4f, 0, RGB(110, 76, 52), RGB(110, 76, 52), 1, 0);
+            box(cx + fx * 8.65f, 13.8f, cz + fz * 8.65f, yaw == 0 ? 2.3f : 0.25f, 1.4f, yaw == 0 ? 0.25f : 2.3f, 0, RGB(110, 76, 52), RGB(110, 76, 52), 1, 0);
             TEXS(TX_METAL, 6);
-            box(cx + fx * 8.95f + px * 1.6f, 4.8f, cz + fz * 8.95f + pz * 1.6f, 0.35f, 0.7f, 0.35f, 0, RGB(200, 170, 100), RGB(200, 170, 100), 1, 0);
+            box(cx + fx * 8.95f + px * 2.1f, 6.4f, cz + fz * 8.95f + pz * 2.1f, 0.35f, 0.7f, 0.35f, 0, RGB(200, 170, 100), RGB(200, 170, 100), 1, 0);
             floor_i = 1;
         } else floor_i = 0;
 
         /* finestre ai piani con cornice, davanzale e persiane */
         for (; floor_i < 3; floor_i++) {
-            float wy = floor_i == 0 ? 4.0f : (floor_i == 1 ? 16.5f : 29.0f);
-            float wh = floor_i == 0 ? 7.0f : 10.5f;
+            float wy = floor_i == 0 ? 4.0f : (floor_i == 1 ? 19.0f : 32.0f);
+            float wh = floor_i == 0 ? 8.0f : 10.0f;
             unsigned hf = hash2(hw, floor_i);
             uint32_t wc;
             float wx = cx + fx * 8.35f, wz = cz + fz * 8.35f;
@@ -3458,12 +3538,13 @@ static void draw_prop(int t, int tx, int ty, unsigned h)
 {
     float cx = tx * TS + 8.0f, cz = ty * TS + 8.0f, yaw = ((int)(h % 7) - 3) * 0.06f;
     float ex = cx - camEye.x, ez = cz - camEye.z;
-    if (ex * ex + ez * ez < 30 * 30) return;   /* non coprire la visuale */
+    if (ex * ex + ez * ez < 14 * 14) return;   /* non coprire la visuale */
     light_at(cx, cz);
     switch (t) {
     case T_LAMP:
         /* lampione in ghisa: base a campana, fusto rastremato con anelli, braccetti ricurvi */
         pb_x = cx; pb_z = cz; pb_c = 1; pb_s = 0; pb_rolling = 0; pb_y = cur_gy;
+        pb_sc = 0.78f;    /* circa il doppio dell'altezza del cavaliere */
         TEXS(TX_METAL, 12);
         mat_metal = 1;
         limb_taper = 0.55f;
@@ -3476,14 +3557,15 @@ static void draw_prop(int t, int tx, int ty, unsigned h)
         limbL(0, 28, 0, 2.6f, 29.5f, 0, 0.3f, 0.3f, RGB(64, 64, 74));
         limbL(0, 28, 0, -2.6f, 29.5f, 0, 0.3f, 0.3f, RGB(64, 64, 74));
         mat_metal = 0;
+        pb_sc = 1;
         TEXS(TX_WHITE, 32);
-        box(cx, 31, cz, 2.0f, 5, 2.0f, 0.785f, RGB(255, 205, 130), RGB(255, 225, 160), 1, 1);
+        box(cx, 24.2f, cz, 1.6f, 3.9f, 1.6f, 0.785f, RGB(255, 205, 130), RGB(255, 225, 160), 1, 1);
         TEXS(TX_METAL, 12);
-        box(cx, 36, cz, 2.7f, 1.4f, 2.7f, 0.785f, RGB(60, 60, 70), RGB(70, 70, 80), 1, 0);
-        box(cx, 37.4f, cz, 0.9f, 2, 0.9f, 0.785f, RGB(60, 60, 70), RGB(70, 70, 80), 1, 0);
+        box(cx, 28.1f, cz, 2.1f, 1.1f, 2.1f, 0.785f, RGB(60, 60, 70), RGB(70, 70, 80), 1, 0);
+        box(cx, 29.2f, cz, 0.7f, 1.6f, 0.7f, 0.785f, RGB(60, 60, 70), RGB(70, 70, 80), 1, 0);
         {   /* cono di luce nella nebbia */
             int k;
-            V3 apex = v3(cx, 32 + cur_gy, cz);
+            V3 apex = v3(cx, 25 + cur_gy, cz);
             for (k = 0; k < 10; k++) {
                 float a0 = 2 * PI * k / 10, a1 = 2 * PI * (k + 1) / 10;
                 RV A, B, C;
@@ -3493,8 +3575,8 @@ static void draw_prop(int t, int tx, int ty, unsigned h)
                 r_tri(&A, &B, &C, TX_WHITE, RB_ADD);
             }
         }
-        glow(cx, 33.5f, cz, 15, rgba(RGB(255, 170, 80), 130));
-        glow(cx, 33.5f, cz, 5, rgba(RGB(255, 235, 190), 220));
+        glow(cx, 26.1f, cz, 12, rgba(RGB(255, 170, 80), 130));
+        glow(cx, 26.1f, cz, 4, rgba(RGB(255, 235, 190), 220));
         ground_spot(cx, cz, 36, 0.5f, rgba(RGB(255, 160, 70), 70), RB_ADD);
         break;
     case T_GRAVE:
@@ -3514,15 +3596,18 @@ static void draw_prop(int t, int tx, int ty, unsigned h)
     case T_CRATE:
         TEXS(TX_WOOD, 12);
         if (h % 2) {
-            box(cx, 0, cz, 5.5f, 9, 5.5f, yaw, RGB(140, 104, 70), RGB(150, 112, 76), 1, 0);
+            box(cx, 0, cz, 3.6f, 5.8f, 3.6f, yaw, RGB(140, 104, 70), RGB(150, 112, 76), 1, 0);
             TEXS(TX_METAL, 8);
-            box(cx, 4, cz, 5.7f, 1, 5.7f, yaw, RGB(70, 66, 66), RGB(70, 66, 66), 1, 0);
+            box(cx, 2.6f, cz, 3.7f, 0.7f, 3.7f, yaw, RGB(70, 66, 66), RGB(70, 66, 66), 1, 0);
         } else {
-            box(cx, 0, cz, 4.5f, 11, 4.5f, 0, RGB(124, 90, 60), RGB(104, 76, 52), 1, 0);
-            box(cx, 0, cz, 4.5f, 11, 4.5f, 0.785f, RGB(124, 90, 60), RGB(104, 76, 52), 1, 0);
+            /* barile */
+            pb_x = cx; pb_z = cz; pb_c = 1; pb_s = 0; pb_rolling = 0; pb_y = cur_gy;
+            limb_bulge = 0.12f;
+            limbL(0, 0, 0, 0, 7.2f, 0, 2.8f, 2.8f, RGB(124, 90, 60));
+            limb_bulge = 0;
             TEXS(TX_METAL, 8);
-            box(cx, 2, cz, 4.8f, 1, 4.8f, 0.785f, RGB(66, 66, 70), RGB(66, 66, 70), 1, 0);
-            box(cx, 8, cz, 4.8f, 1, 4.8f, 0.785f, RGB(66, 66, 70), RGB(66, 66, 70), 1, 0);
+            limbL(0, 1.3f, 0, 0, 1.9f, 0, 3.0f, 3.0f, RGB(66, 66, 70));
+            limbL(0, 5.3f, 0, 0, 5.9f, 0, 3.0f, 3.0f, RGB(66, 66, 70));
         }
         break;
     case T_TREE: {
@@ -3531,6 +3616,7 @@ static void draw_prop(int t, int tx, int ty, unsigned h)
         float bx2 = ((int)(h % 7) - 3) * 0.6f, bz2 = ((int)((h >> 4) % 7) - 3) * 0.6f;
         uint32_t bk = RGB(84, 72, 64);
         pb_x = cx; pb_z = cz; pb_c = 1; pb_s = 0; pb_rolling = 0; pb_y = cur_gy;
+        pb_sc = 1.6f;     /* albero adulto: molto piu' alto del cavaliere */
         TEXS(TX_BARK, 10);
         limb_taper = 0.8f;
         limbL(0, 0, 0, bx2, 12, bz2, 2.6f, 2.6f, bk);
@@ -3543,7 +3629,7 @@ static void draw_prop(int t, int tx, int ty, unsigned h)
                 limb_taper = 0.4f;
                 limbL(bx2 * 0.5f, 14 + i * 3, bz2 * 0.5f, cosf(a) * 9, 20 + i * 3, sinf(a) * 9, 0.9f, 0.9f, bk);
             }
-            limb_taper = 1.0f;
+            limb_taper = 1.0f; pb_sc = 1;
             break;
         }
         for (i = 0; i < 3; i++) {   /* radici */
@@ -3560,7 +3646,7 @@ static void draw_prop(int t, int tx, int ty, unsigned h)
             limbL(ex2, ey2, ez2, ex2 + cosf(a + 0.7f) * l * 0.6f, ey2 + 2.5f, ez2 + sinf(a + 0.7f) * l * 0.6f, 0.45f, 0.45f, shade(bk, 1.05f));
             limbL(ex2, ey2, ez2, ex2 + cosf(a - 0.6f) * l * 0.5f, ey2 - 1.0f, ez2 + sinf(a - 0.6f) * l * 0.5f, 0.4f, 0.4f, shade(bk, 1.05f));
         }
-        limb_taper = 1.0f;
+        limb_taper = 1.0f; pb_sc = 1;
         break;
     }
     case T_WELL:
@@ -3677,24 +3763,29 @@ static void draw_pine(float cx, float cz, unsigned h)
     pb_x = cx; pb_z = cz; pb_c = 1; pb_s = 0; pb_rolling = 0; pb_y = cur_gy;
     TEXS(TX_BARK, 8);
     limb_taper = 0.35f;
-    limbL(0, 0, 0, lx * 20 * s, 26 * s, lz * 20 * s, 1.5f * s, 1.5f * s, RGB(92, 76, 66));     /* tronco rastremato */
+    {   /* abete alto (4-5 volte il cavaliere): tronco lungo e chioma che parte in alto */
+        float sv = s * 1.85f, sw = s * 1.3f;
+        limbL(0, 0, 0, lx * 20 * sv, 30 * sv, lz * 20 * sv, 1.6f * sw, 1.6f * sw, RGB(92, 76, 66));
+        limb_taper = 1.0f;
+        TEXS(TX_GRASS, 6);
+        if (far) {
+            cone(cx + lx * 8 * sv, 8 * sv, cz + lz * 8 * sv, 8.5f * sw, 14 * sv, fol, 7);
+            cone(cx + lx * 16 * sv, 17 * sv, cz + lz * 16 * sv, 5.6f * sw, 12 * sv, shade(fol, 1.1f), 6);
+        } else {
+            int k;
+            for (k = 0; k < 4; k++) {
+                float t = k / 3.0f, yy = (7.5f + k * 5.6f) * sv;
+                ragged_cone(cx + lx * yy * 0.77f, yy, cz + lz * yy * 0.77f, (9.2f - 6.4f * t) * sw, (8.0f - 2.0f * t) * sv, shade(fol, 0.92f + 0.08f * k), 10, h + k * 17);
+            }
+        }
+        TEXS(TX_BARK, 8);
+    }
     limb_taper = 1.0f;
     if (ex * ex + ez * ez < 60 * 60) {   /* radici che affiorano */
         int k;
         for (k = 0; k < 3; k++) {
             float a = k * 2.1f + (h % 5);
             limbL(0, 1.2f, 0, cosf(a) * 3.2f * s, -0.2f, sinf(a) * 3.2f * s, 0.7f * s, 0.5f * s, RGB(86, 72, 62));
-        }
-    }
-    TEXS(TX_GRASS, 6);
-    if (far) {
-        cone(cx + lx * 5, 5 * s, cz + lz * 5, 8.5f * s, 13 * s, fol, 7);
-        cone(cx + lx * 12, 14 * s, cz + lz * 12, 5.6f * s, 13 * s, shade(fol, 1.1f), 6);
-    } else {
-        int k;
-        for (k = 0; k < 4; k++) {
-            float t = k / 3.0f, yy = (4.5f + k * 6.0f) * s;
-            ragged_cone(cx + lx * yy * 0.77f, yy, cz + lz * yy * 0.77f, (9.2f - 6.4f * t) * s, (9.5f - 2.5f * t) * s, shade(fol, 0.92f + 0.08f * k), 10, h + k * 17);
         }
     }
 }
@@ -3796,10 +3887,10 @@ static void draw_outdoor(int tx, int ty, int t, unsigned h)
     float s0 = hshade[ty][tx], s1 = hshade[ty][tx + 1], s2 = hshade[ty + 1][tx + 1], s3 = hshade[ty + 1][tx];
     Lt l0 = cgl(tx, ty), l1 = cgl(tx + 1, ty), l2 = cgl(tx + 1, ty + 1), l3 = cgl(tx, ty + 1);
     int tex = TX_GRASS;
-    float ts = 32, ex = cx - camEye.x, ez = cz - camEye.z, dcam = sqrtf(ex * ex + ez * ez);
+    float ts = 18, ex = cx - camEye.x, ez = cz - camEye.z, dcam = sqrtf(ex * ex + ez * ez);
     uint32_t base = RGB(104 + (int)(h % 8), 112 + (int)(h % 8), 92 + (int)(h % 6));
     if (t == T_DIRT || t == T_RUIN) { tex = TX_DIRT; base = RGB(130, 118, 104); }
-    if (t == T_ROCK) { tex = TX_ROCK; ts = 20; base = RGB(120, 118, 122); }
+    if (t == T_ROCK) { tex = TX_ROCK; ts = 14; base = RGB(120, 118, 122); }
     if (t == T_WATER || t == T_PIER) { tex = TX_DIRT; base = RGB(60, 58, 56); }
     if (ty < 58 && t == T_GRASS) base = RGB(100 + (int)(h % 8), 104 + (int)(h % 8), 90);   /* erba piu' secca in collina */
     if (tex == TX_GRASS || (tex == TX_DIRT && t != T_WATER && t != T_PIER)) {
@@ -3851,7 +3942,7 @@ static void draw_outdoor(int tx, int ty, int t, unsigned h)
         break;
     }
     case T_PINE:
-        if (dcam > 32) draw_pine(cx + (h % 5) - 2.0f, cz + ((h >> 4) % 5) - 2.0f, h);
+        if (dcam > 20) draw_pine(cx + (h % 5) - 2.0f, cz + ((h >> 4) % 5) - 2.0f, h);
         break;
     case T_BOULDER: draw_boulder(cx, cz, h); break;
     case T_RUIN: draw_ruin(tx, ty, h); break;
@@ -3886,6 +3977,7 @@ static void draw_outdoor(int tx, int ty, int t, unsigned h)
 
 static void draw_world(float cx, float cz)
 {
+    pb_sc = 1;
     int tcx = (int)(cx / TS), tcz = (int)(cz / TS), tx, ty, gr = perf_lvl >= 2 ? GR - 3 : (perf_lvl ? GR - 1 : GR);
     float bx = -cosf(camYaw), bz = -sinf(camYaw);
     build_corner_grid(tcx, tcz);
@@ -3915,7 +4007,7 @@ static void draw_world(float cx, float cz)
                     cur_tex = TX_FLAG;
                     emit_quad(v3(x0, sy, z0), v3(x0 + TS, sy, z0), v3(x0 + TS, sy, z0 + TS), v3(x0, sy, z0 + TS),
                               litv(fb2, l0, 1), litv(fb2, l1, 1), litv(fb2, l2, 1), litv(fb2, l3, 1),
-                              x0 / 32, z0 / 32, (x0 + TS) / 32, z0 / 32, (x0 + TS) / 32, (z0 + TS) / 32, x0 / 32, (z0 + TS) / 32,
+                              x0 / 13, z0 / 13, (x0 + TS) / 13, z0 / 13, (x0 + TS) / 13, (z0 + TS) / 13, x0 / 13, (z0 + TS) / 13,
                               TX_FLAG, RB_OPAQUE);
                     {
                         static const int ddx[4] = { 0, 0, 1, -1 }, ddy[4] = { 1, -1, 0, 0 };
@@ -3938,7 +4030,7 @@ static void draw_world(float cx, float cz)
                     cur_tex = TX_COBBLE;
                     emit_quad(v3(x0, by, z0), v3(x0 + TS, by, z0), v3(x0 + TS, by, z0 + TS), v3(x0, by, z0 + TS),
                               litv(base, l0, 1), litv(base, l1, 1), litv(base, l2, 1), litv(base, l3, 1),
-                              x0 / 32, z0 / 32, (x0 + TS) / 32, z0 / 32, (x0 + TS) / 32, (z0 + TS) / 32, x0 / 32, (z0 + TS) / 32,
+                              x0 / 13, z0 / 13, (x0 + TS) / 13, z0 / 13, (x0 + TS) / 13, (z0 + TS) / 13, x0 / 13, (z0 + TS) / 13,
                               TX_COBBLE, RB_OPAQUE);
                 }
                 if (h % 7 == 0 && t == T_FLOOR) {
@@ -4088,6 +4180,7 @@ static void draw_player(void)
     if (P.state == PS_DEAD && mode == M_DEAD) return;
     if (P.iframes > 0 && P.iframes < 5000 && P.state != PS_ROLL && (frame & 2)) return;
     hi_detail = 1;
+    pb_sc = CS;
 
     /* quanto si sta muovendo (per l'ampiezza del passo) */
     {
@@ -4101,7 +4194,7 @@ static void draw_player(void)
     light_at(x, z);
     {
         float gh0 = ground_h(x, z);
-        cur_gy = gh0; shadow(x, z, 6); cur_gy = 0;
+        cur_gy = gh0; shadow(x, z, 3.4f); cur_gy = 0;
         pb_y = gh0;
         if (P.state == PS_ROLL) {
             /* in pendenza la capriola segue il terreno piu' alto sotto il corpo, cosi' non ci affonda */
@@ -4118,7 +4211,7 @@ static void draw_player(void)
             /* saltello all'indietro: niente capriola, il corpo resta rivolto in avanti */
             float t = P.timer / 13.0f;
             pb_c = cosf(ang); pb_s = sinf(ang);
-            pb_y += sinf(t * PI) * 2.2f;
+            pb_y += sinf(t * PI) * 1.2f;
         } else {
             /* tuffo (0-2), rotazione (2-15), rialzata (15-22) */
             float t = (P.timer - 2) / 13.0f;
@@ -4138,7 +4231,7 @@ static void draw_player(void)
             /* balzo: il corpo si stacca da terra durante la carica e ricade nel colpo */
             int W = AW[P.atk], A = AA[P.atk];
             float t = (float)(P.timer - (W - 5)) / (A + 3);
-            if (t > 0 && t < 1) pb_y += sinf(t * PI) * (P.atk == AT_RUN ? 4.0f : 2.5f);
+            if (t > 0 && t < 1) pb_y += sinf(t * PI) * (P.atk == AT_RUN ? 2.2f : 1.4f);
         }
     }
 
@@ -4735,6 +4828,7 @@ static void draw_enemy(Enemy *e)
     uint32_t body, dark, eye = RGB(255, 80, 40);
     float gh;
     if (dxp * dxp + dzp * dzp > 220 * 220 || !vis(x, z, 30)) return;
+    pb_sc = CS;
     light_at(x, z);
     gh = ground_h(x, z);
     cur_gy = gh;
@@ -4752,7 +4846,7 @@ static void draw_enemy(Enemy *e)
         cur_gy = 0;
         if (e->kind == 2) draw_wolf(e, gh); else draw_colossus(e, gh);
         cur_gy = gh;
-        if (e->hp < k->hp) hpbar3d(x, z, e->kind == 2 ? 15.0f : 36.0f, (float)e->hp / k->hp, e->kind == 3 ? 12 : 7);
+        if (e->hp < k->hp) hpbar3d(x, z, e->kind == 2 ? 9.0f : 21.0f, (float)e->hp / k->hp, e->kind == 3 ? 8 : 5);
         cur_gy = 0;
         return;
     }
@@ -4782,26 +4876,29 @@ static void draw_enemy(Enemy *e)
     cur_gy = 0;
     {
         int moving = e->state == ES_CHASE, far = dxp * dxp + dzp * dzp > 120 * 120, i;
-        float ph = frame * 0.32f + x * 0.13f, amp = moving ? 1.0f : 0.12f;
-        float wind = e->state == ES_WIND ? 1.0f : 0, strike = e->state == ES_STRIKE ? 1.0f : 0;
+        float ph = e->wph + x * 0.13f, amp = 0.12f + 0.88f * e->bm;
+        float wind = e->bw, strike = e->bs, stag = e->bg;
+        (void)moving;
         pb_x = x; pb_z = z; pb_c = c; pb_s = s; pb_rolling = 0; pb_y = gh + e->az;
         if (e->tilt < -0.02f) { pb_rolling = 1; pb_roll = e->tilt; pb_rollC = 1; pb_rollF = 0; }
-        if (e->state == ES_DEAD) { wind = strike = 0; amp = 0; }
+        if (e->state == ES_DEAD) { wind = strike = stag = 0; amp = 0; }
         if (e->kind == 0) {
             /* --- Reietto: figura scarna e curva, stracci, mannaia arrugginita --- */
-            float hip = 7.4f + fabsf(sinf(ph)) * 0.4f * amp, hunch = 1.8f + wind * 0.8f - strike * 0.6f;
+            float hip = 7.2f + fabsf(sinf(ph)) * 0.4f * amp - wind * 0.7f, hunch = 1.8f + wind * 1.0f - strike * 0.4f - stag * 2.2f;
             float shF = hunch + 0.4f, shU = 12.6f + br * 0.4f - hunch * 0.3f;
             uint32_t skin = body, rag = e->flash > 0 ? body : RGB(84, 72, 62);
             TEXS(TX_BARK, 5);
             for (i = 0; i < 2; i++) {   /* gambe magre */
-                float sd = i ? -1.3f : 1.3f, a1 = sinf(ph + i * PI) * 0.55f * amp;
+                float sd = i ? -1.3f : 1.3f, a1 = sinf(ph + i * PI) * 0.55f * amp + (i ? -0.4f : 0.5f) * strike - 0.25f * stag;
+                float kc = cosf(ph + i * PI), kn = (0.15f + 0.85f * (kc > 0 ? kc : 0)) * amp * 0.9f + wind * 0.5f;   /* ginocchio piegato quando la gamba torna avanti */
                 float kf = sinf(a1) * 3.8f + 0.4f, ku = hip - cosf(a1) * 3.8f;
-                float ff = kf + sinf(a1 - 0.35f) * 3.6f, fu = 0.3f;
+                float ff = kf + sinf(a1 - kn) * 3.6f, fu = ku - cosf(a1 - kn) * 3.6f;
+                if (fu < 0.3f) fu = 0.3f;
                 limb_taper = 0.8f;
                 limbL(0, hip, sd, kf, ku, sd * 1.1f, 0.75f, 0.75f, dark);
                 limbL(kf, ku, sd * 1.1f, ff, fu, sd * 1.1f, 0.55f, 0.55f, dark);
                 limb_taper = 1.0f;
-                blobL(ff + 0.6f, 0.3f, sd * 1.1f, 0.9f, 0.35f, 0.55f, shade(dark, 0.8f), 3, 5);
+                blobL(ff + 0.6f, fu, sd * 1.1f, 0.9f, 0.35f, 0.55f, shade(dark, 0.8f), 3, 5);
             }
             /* busto curvo, costole e stracci */
             limb_taper = 1.25f;
@@ -4835,7 +4932,7 @@ static void draw_enemy(Enemy *e)
             }
             /* braccio destro con la mannaia: alzata indietro in carica, calata nel colpo */
             {
-                float ra = wind ? -2.4f : (strike ? 1.3f : 0.55f + sinf(ph) * 0.2f * amp);
+                float ra0 = 0.55f + sinf(ph) * 0.2f * amp, ra = ra0 + wind * (-2.4f - ra0) + strike * (1.3f - ra0) * (1 - wind) - stag * 1.2f;
                 float ef = shF + sinf(ra) * 3.6f, eu = shU - cosf(ra) * 3.6f;
                 float hf2 = ef + sinf(ra + 0.5f) * 3.4f, hu2 = eu - cosf(ra + 0.5f) * 3.4f;
                 float bf = sinf(ra + 1.2f), bu = -cosf(ra + 1.2f);
@@ -4846,29 +4943,31 @@ static void draw_enemy(Enemy *e)
                 mat_metal = 1; TEXS(TX_METAL, 5);
                 limbL(hf2 + bf * 3.0f, hu2 + bu * 3.0f, -2.6f, hf2 + bf * 7.5f, hu2 + bu * 7.5f, -2.6f, 0.2f, 1.25f, RGB(150, 120, 96));
                 mat_metal = 0;
-                if (strike) {
+                if (strike > 0.5f) {
                     V3 tp = L2W(hf2 + bf * 7.5f, hu2 + bu * 7.5f, -2.6f);
                     glow(tp.x, tp.y, tp.z, 4, rgba(RGB(255, 160, 110), 120));
                 }
             }
         } else {
             /* --- Lanciere: soldato in armatura, elmo a punta, lunga picca e scudo --- */
-            float hip = 10.6f + fabsf(sinf(ph)) * 0.4f * amp, lean = strike * 1.6f - wind * 0.9f;
-            float shU = 18.4f + br * 0.3f, sl = strike ? 7.0f : (wind ? -3.0f : 0.0f);
+            float hip = 10.4f + fabsf(sinf(ph)) * 0.4f * amp - wind * 0.8f - strike * 0.6f, lean = strike * 1.8f - wind * 1.0f - stag * 2.0f;
+            float shU = 18.4f + br * 0.3f - wind * 0.6f, sl = 7.0f * strike - 3.0f * wind * (1 - strike);
             uint32_t cloth = e->flash > 0 ? body : RGB(130, 50, 54), mtl = body, mtlD = shade(body, 0.7f);
             mat_metal = 1;
             TEXS(TX_METAL, 8);
             for (i = 0; i < 2; i++) {
-                float sd = i ? -1.6f : 1.6f, st = strike ? (i ? -0.5f : 0.6f) : 0;
-                float a1 = sinf(ph + i * PI) * 0.55f * amp + st;
+                float sd = i ? -1.6f : 1.6f, st = strike * (i ? -0.5f : 0.65f) + wind * (i ? 0.35f : -0.2f);
+                float a1 = sinf(ph + i * PI) * 0.5f * amp + st;
+                float kc = cosf(ph + i * PI), kn = (0.12f + 0.8f * (kc > 0 ? kc : 0)) * amp * 0.85f + wind * 0.35f + strike * (i ? 0.1f : 0.5f);
                 float kf = sinf(a1) * 5.0f, ku = hip - cosf(a1) * 5.0f;
-                float ff = kf + sinf(a1 - 0.4f * amp) * 5.0f, fu = 0.5f;
+                float ff = kf + sinf(a1 - kn) * 5.0f, fu = ku - cosf(a1 - kn) * 5.0f;
+                if (fu < 0.5f) fu = 0.5f;
                 limb_taper = 0.85f;
                 limbL(0, hip, sd, kf, ku, sd, 1.05f, 1.05f, mtlD);
                 limbL(kf, ku, sd, ff, fu, sd, 0.8f, 0.8f, mtl);
                 limb_taper = 1.0f;
                 blobL(kf + 0.5f, ku, sd, 0.75f, 0.8f, 0.75f, mtl, 3, 6);    /* ginocchiera */
-                blobL(ff + 0.7f, 0.5f, sd, 1.15f, 0.5f, 0.7f, mtlD, 3, 6);
+                blobL(ff + 0.7f, fu, sd, 1.15f, 0.5f, 0.7f, mtlD, 3, 6);
             }
             limb_taper = 1.3f;
             limbL(0, hip, 0, lean, shU - 1.5f, 0, 1.9f, 1.45f, mtlD);
@@ -4900,7 +4999,7 @@ static void draw_enemy(Enemy *e)
             blobL(lean + 3.3f, shU - 5.5f, 4.3f, 0.6f, 0.6f, 0.35f, RGB(200, 170, 110), 3, 5);
             /* picca tenuta a due mani all'altezza del fianco */
             {
-                float pu = 12.0f + (wind ? 1.2f : 0), base = -6.0f + sl, tipf = 26.0f + sl;
+                float pu = 12.0f + 1.2f * wind - 0.8f * strike, base = -6.0f + sl, tipf = 26.0f + sl;
                 limbL(lean, shU - 0.6f, -3.0f, lean + 2.0f + sl * 0.4f, pu + 0.6f, -2.8f, 0.7f, 0.7f, mtlD);
                 TEXS(TX_WOOD, 10);
                 mat_metal = 0;
@@ -4912,7 +5011,7 @@ static void draw_enemy(Enemy *e)
                 mat_metal = 0;
                 TEXS(TX_CLOTH, 4);
                 limbL(tipf - 3.6f, pu + 0.3f, -2.0f, tipf - 4.6f - mvAmtE(moving) * 1.5f, pu - 1.8f, -2.2f, 0.5f, 0.12f, RGB(180, 40, 40));
-                if (strike) {
+                if (strike > 0.5f) {
                     V3 tp = L2W(tipf, pu + 0.35f, -2.0f);
                     TEXS(TX_WHITE, 32);
                     glow(tp.x, tp.y, tp.z, 4.5f, rgba(RGB(230, 235, 255), 140));
@@ -4923,7 +5022,7 @@ static void draw_enemy(Enemy *e)
     pb_rolling = 0;
     cur_gy = gh;
     TEXS(TX_WHITE, 32);
-    if (e->hp < k->hp && e->state != ES_DEAD) hpbar3d(x, z, e->kind ? 29.0f : 20.0f, (float)e->hp / k->hp, 8);
+    if (e->hp < k->hp && e->state != ES_DEAD) hpbar3d(x, z, e->kind ? 17.0f : 12.0f, (float)e->hp / k->hp, 5);
     cur_gy = 0;
 }
 
@@ -5247,6 +5346,458 @@ static void vignette(void)
     }
 }
 
+/* ================================================================== */
+/* interni                                                            */
+/* ================================================================== */
+static int door_at(int tx, int ty, int d)
+{
+    static const int ddx[4] = { 0, 0, 1, -1 }, ddy[4] = { 1, -1, 0, 0 };
+    if (!is_wall(tx, ty) || is_wall(tx + ddx[d], ty + ddy[d]) || !in_town(tx, ty)) return 0;
+    return hash2(tx * 4 + d, ty) % 6 == 0;     /* stessa regola con cui le facciate disegnano il portone */
+}
+static int door_near(float *ox, float *oy, unsigned *id)
+{
+    static const int ddx[4] = { 0, 0, 1, -1 }, ddy[4] = { 1, -1, 0, 0 };
+    int ptx = (int)(P.x / TS), pty = (int)(P.y / TS), tx, ty, d;
+    if (inRoom) return 0;
+    for (ty = pty - 2; ty <= pty + 2; ty++)
+        for (tx = ptx - 2; tx <= ptx + 2; tx++)
+            for (d = 0; d < 4; d++) {
+                float dx, dy;
+                if (!door_at(tx, ty, d)) continue;
+                dx = tx * TS + 8 + ddx[d] * 8.6f - P.x; dy = ty * TS + 8 + ddy[d] * 8.6f - P.y;
+                if (dx * dx + dy * dy < 10 * 10) {
+                    *ox = tx * TS + 8 + ddx[d] * 13.0f; *oy = ty * TS + 8 + ddy[d] * 13.0f;
+                    *id = hash2(tx + WX0, ty + WY0) ^ (unsigned)d;
+                    return 1;
+                }
+            }
+    return 0;
+}
+static void add_rl(float x, float y, float z, float R, float st, float r, float g, float b)
+{
+    if (nrl >= 12) return;
+    rl[nrl].x = x; rl[nrl].y = y; rl[nrl].z = z; rl[nrl].R = R; rl[nrl].s = st; rl[nrl].r = r; rl[nrl].g = g; rl[nrl].b = b; nrl++;
+}
+static void room_build(unsigned id)
+{
+    int x, y, i;
+    roomType = (int)(id % 4);
+    memset(rgrid, 0, sizeof(rgrid));
+    for (x = 0; x < RW; x++) { rgrid[0][x] = 1; rgrid[RH - 1][x] = 1; }
+    for (y = 0; y < RH; y++) { rgrid[y][0] = 1; rgrid[y][RW - 1] = 1; }
+    nrl = 0; roomChestX = roomChestY = -1;
+    switch (roomType) {
+    case 0:   /* taverna: bancone, tavoli, camino */
+        rgrid[1][2] = rgrid[1][3] = rgrid[1][4] = 2;
+        rgrid[3][2] = 2; rgrid[3][4] = 2;
+        add_rl(1 * TS + 2, 8, 3 * TS, 70, 1.2f, 1.0f, 0.55f, 0.22f);          /* camino */
+        add_rl(2.5f * TS, 30, 3.5f * TS, 55, 0.7f, 1.0f, 0.8f, 0.55f);         /* lanterne appese */
+        add_rl(4.5f * TS, 30, 3.5f * TS, 55, 0.7f, 1.0f, 0.8f, 0.55f);
+        add_rl(3.5f * TS, 10, 1.6f * TS, 40, 0.5f, 1.0f, 0.7f, 0.35f);
+        roomChestX = 5; roomChestY = 4;
+        break;
+    case 1:   /* cappella: altare, panche, candele, vetrata */
+        rgrid[1][3] = 2;
+        rgrid[3][1] = rgrid[3][2] = rgrid[3][4] = rgrid[3][5] = 2;
+        add_rl(3.5f * TS, 10, 1.5f * TS, 60, 1.1f, 1.0f, 0.68f, 0.32f);        /* candele dell'altare */
+        add_rl(1.4f * TS, 8, 1.4f * TS, 35, 0.6f, 1.0f, 0.7f, 0.35f);
+        add_rl(5.6f * TS, 8, 1.4f * TS, 35, 0.6f, 1.0f, 0.7f, 0.35f);
+        add_rl(3.5f * TS, 20, 0.6f * TS, 70, 0.5f, 0.35f, 0.45f, 0.9f);        /* luce colorata della vetrata */
+        if ((id >> 5) % 2) { roomChestX = 1; roomChestY = 4; }
+        break;
+    case 2:   /* casa: letto, tavolo, scaffali, camino */
+        rgrid[1][5] = rgrid[2][5] = 2;
+        rgrid[2][2] = 2;
+        rgrid[1][1] = 2;
+        add_rl(1 * TS + 2, 8, 3.5f * TS, 65, 1.1f, 1.0f, 0.55f, 0.22f);
+        add_rl(2.5f * TS, 9, 2.5f * TS, 40, 0.6f, 1.0f, 0.72f, 0.38f);         /* candela sul tavolo */
+        roomChestX = 5; roomChestY = 4;
+        break;
+    default:  /* bottega del fabbro: incudine, forgia, rastrelliere */
+        rgrid[1][1] = rgrid[1][2] = 2;
+        rgrid[2][4] = 2;
+        rgrid[1][5] = 2;
+        add_rl(1.5f * TS, 8, 1.6f * TS, 80, 1.4f, 1.0f, 0.42f, 0.12f);         /* forgia */
+        add_rl(4.5f * TS, 28, 3.5f * TS, 50, 0.6f, 1.0f, 0.75f, 0.42f);
+        if ((id >> 5) % 2 == 0) { roomChestX = 5; roomChestY = 4; }
+        break;
+    }
+    if (roomChestX >= 0) rgrid[roomChestY][roomChestX] = 2;
+    roomChestOpen = 0;
+    for (i = 0; i < nOpened; i++) if (openedChests[i] == id) roomChestOpen = 1;
+}
+static void room_enter(unsigned id, float ox, float oy)
+{
+    roomOutX = ox; roomOutY = oy; roomOutYaw = camYaw;
+    roomId = id; inRoom = 1;
+    room_build(id);
+    P.x = 3.5f * TS; P.y = (RH - 1) * TS - 6; P.fx = 0; P.fy = -1; P.vx = P.vy = 0;
+    P.lock = -1; P.sprint = 0;
+    camYaw = -PI / 2; camX = P.x; camZ = P.y;
+    trN = 0;
+    sfx(SFX_MENU);
+}
+static void room_exit(void)
+{
+    inRoom = 0; nrl = 0;
+    P.x = roomOutX; P.y = roomOutY; P.vx = P.vy = 0;
+    camYaw = roomOutYaw; camX = P.x; camZ = P.y;
+    P.fx = cosf(camYaw + PI); P.fy = sinf(camYaw + PI);
+    trN = 0;
+    sfx(SFX_MENU);
+}
+static int room_near_exit(void) { return P.y > (RH - 2) * TS + 4 && fabsf(P.x - 3.5f * TS) < 13; }
+static int room_near_chest(void)
+{
+    float dx, dy;
+    if (roomChestX < 0 || roomChestOpen) return 0;
+    dx = (roomChestX + 0.5f) * TS - P.x; dy = (roomChestY + 0.5f) * TS - P.y;
+    return dx * dx + dy * dy < 16 * 16;
+}
+static void room_interact(const Input *in)
+{
+    if (!(in->pressed & B_SELECT) || P.state != PS_FREE) return;
+    if (room_near_chest()) {
+        char b[40], n[12];
+        int v = 150 + (int)((roomId >> 3) % 6) * 60;
+        roomChestOpen = 1;
+        if (nOpened < 48) openedChests[nOpened++] = roomId;
+        if ((roomId >> 9) % 5 == 0 && P.flasks < P.maxFlask) { P.flasks = P.maxFlask; set_msg("BAULE: FIALE RIEMPITE", 150); }
+        else { P.frags += v; strcpy(b, "BAULE: +"); itoa_s(v, n); strcat(b, n); strcat(b, " FRAMMENTI"); set_msg(b, 150); }
+        spawn_parts((roomChestX + 0.5f) * TS, (roomChestY + 0.5f) * TS, 20, RGB(255, 210, 120), 1.4f);
+        sfx(SFX_PICK);
+    } else if (room_near_exit()) room_exit();
+    else set_msg("SEI AL CHIUSO", 60);
+}
+static void open_map(void)
+{
+    if (inRoom) { set_msg("SEI AL CHIUSO", 60); return; }
+    mode = M_MAP; mapZoom = 0;
+    mapCurX = P.x / TS + WX0; mapCurY = P.y / TS + WY0;
+}
+
+/* ---- disegno degli interni ---- */
+static void rquad(V3 a, V3 b, V3 c, V3 d, uint32_t col, int tex, float ru, float rv)
+{
+    /* quadrilatero illuminato vertice per vertice dalle luci della stanza */
+    Lt la = light_point(a.x, a.z, 1), lb = light_point(b.x, b.z, 1), lc = light_point(c.x, c.z, 1), ld = light_point(d.x, d.z, 1);
+    float fa = 0.75f + a.y * 0.004f, fc = 0.75f + c.y * 0.004f;
+    emit_quad(a, b, c, d, litv(col, la, fa), litv(col, lb, fa), litv(col, lc, fc), litv(col, ld, fc), 0, rv, ru, rv, ru, 0, 0, 0, tex, RB_OPAQUE);
+}
+static void rwall(float x0, float z0, float x1, float z1, int tex, uint32_t col, uint32_t wain)
+{
+    /* parete divisa in fasce: zoccolo di legno, intonaco, cornice */
+    float len = sqrtf((x1 - x0) * (x1 - x0) + (z1 - z0) * (z1 - z0)), y[4] = { 0, 7, 26, RCEIL };
+    int seg = (int)(len / 16) + 1, k, b;
+    for (k = 0; k < seg; k++) {
+        float t0 = (float)k / seg, t1 = (float)(k + 1) / seg;
+        float ax = x0 + (x1 - x0) * t0, az = z0 + (z1 - z0) * t0, bx = x0 + (x1 - x0) * t1, bz = z0 + (z1 - z0) * t1;
+        for (b = 0; b < 3; b++) {
+            int tx2 = (b == 0 && wain) ? TX_WOOD : tex;
+            uint32_t c2 = (b == 0 && wain) ? wain : col;
+            rquad(v3(ax, y[b], az), v3(bx, y[b], bz), v3(bx, y[b + 1], bz), v3(ax, y[b + 1], az), c2, tx2, len / seg / 16, (y[b + 1] - y[b]) / 16);
+        }
+    }
+}
+static void rcandle(float x, float y, float z, float h, int seed)
+{
+    pb_x = x; pb_z = z; pb_c = 1; pb_s = 0; pb_rolling = 0; pb_y = y; pb_sc = 1;
+    TEXS(TX_WHITE, 32);
+    limbL(0, 0, 0, 0, h, 0, 0.35f, 0.35f, RGB(225, 215, 190));
+    flame(x, y + h + 0.6f, z, 0.45f, seed);
+    glow(x, y + h + 0.8f, z, 3.5f, rgba(RGB(255, 170, 80), 150));
+}
+static void rtable(float x, float z, float w, float d, uint32_t wood)
+{
+    int k;
+    TEXS(TX_WOOD, 10);
+    box(x, 5.0f, z, w, 0.6f, d, 0, shade(wood, 1.1f), shade(wood, 0.8f), 1, 0);
+    pb_x = x; pb_z = z; pb_c = 1; pb_s = 0; pb_rolling = 0; pb_y = 0; pb_sc = 1;
+    for (k = 0; k < 4; k++) {
+        float lx = (k & 1) ? w - 0.8f : -w + 0.8f, lz = (k & 2) ? d - 0.8f : -d + 0.8f;
+        limbL(lx, 0, lz, lx, 5.0f, lz, 0.4f, 0.4f, shade(wood, 0.8f));
+    }
+}
+static void rbarrel(float x, float z, float h)
+{
+    pb_x = x; pb_z = z; pb_c = 1; pb_s = 0; pb_rolling = 0; pb_y = 0; pb_sc = 1;
+    TEXS(TX_WOOD, 8);
+    limbL(0, 0, 0, 0, h, 0, 2.6f, 2.6f, RGB(118, 84, 56));
+    TEXS(TX_METAL, 6);
+    limbL(0, h * 0.18f, 0, 0, h * 0.26f, 0, 2.75f, 2.75f, RGB(70, 66, 66));
+    limbL(0, h * 0.74f, 0, 0, h * 0.82f, 0, 2.75f, 2.75f, RGB(70, 66, 66));
+}
+static void draw_room(void)
+{
+    const float W = RW * TS, H = RH * TS;
+    int x, y, k;
+    unsigned hs = roomId;
+    uint32_t wall = roomType == 1 ? RGB(130, 126, 130) : (roomType == 3 ? RGB(120, 90, 80) : RGB(170, 156, 136));
+    int wtex = roomType == 1 ? TX_STONE : (roomType == 3 ? TX_BRICK : TX_PLASTER);
+    uint32_t wain = (roomType == 0 || roomType == 2) ? RGB(100, 72, 50) : 0;
+    uint32_t wood = RGB(126, 92, 62);
+    pb_sc = 1;
+    /* pavimento */
+    for (y = 1; y < RH - 1; y++)
+        for (x = 1; x < RW - 1; x++) {
+            float x0 = x * TS, z0 = y * TS;
+            int ft = roomType == 1 ? TX_FLAG : (roomType == 3 ? TX_STONE : TX_WOOD);
+            uint32_t fc = roomType == 1 ? RGB(128, 124, 128) : (roomType == 3 ? RGB(110, 104, 100) : RGB(112, 92, 76));
+            Lt l0 = light_point(x0, z0, 1), l1 = light_point(x0 + TS, z0, 1), l2 = light_point(x0 + TS, z0 + TS, 1), l3 = light_point(x0, z0 + TS, 1);
+            emit_quad(v3(x0, 0, z0), v3(x0 + TS, 0, z0), v3(x0 + TS, 0, z0 + TS), v3(x0, 0, z0 + TS),
+                      litv(fc, l0, 0.85f), litv(fc, l1, 0.85f), litv(fc, l2, 0.85f), litv(fc, l3, 0.85f),
+                      x0 / 18, z0 / 18, (x0 + TS) / 18, z0 / 18, (x0 + TS) / 18, (z0 + TS) / 18, x0 / 18, (z0 + TS) / 18, ft, RB_OPAQUE);
+        }
+    /* tappeto */
+    if (roomType != 3) {
+        uint32_t rc = roomType == 1 ? RGB(100, 24, 30) : RGB(70, 34, 40);
+        Lt lm = light_point(W / 2, H / 2, 1);
+        TEXS(TX_CLOTH, 6);
+        emit_quad(v3(W / 2 - 14, 0.08f, H / 2 - 22), v3(W / 2 + 14, 0.08f, H / 2 - 22), v3(W / 2 + 14, 0.08f, H / 2 + 26), v3(W / 2 - 14, 0.08f, H / 2 + 26),
+                  litv(rc, lm, 1), litv(rc, lm, 1), litv(rc, lm, 1), litv(rc, lm, 1), 0, 0, 2, 0, 2, 3, 0, 3, TX_CLOTH, RB_OPAQUE);
+        emit_quad(v3(W / 2 - 12, 0.1f, H / 2 - 20), v3(W / 2 + 12, 0.1f, H / 2 - 20), v3(W / 2 + 12, 0.1f, H / 2 + 24), v3(W / 2 - 12, 0.1f, H / 2 + 24),
+                  litv(shade(rc, 1.25f), lm, 1), litv(shade(rc, 1.25f), lm, 1), litv(shade(rc, 1.25f), lm, 1), litv(shade(rc, 1.25f), lm, 1), 0, 0, 2, 0, 2, 3, 0, 3, TX_CLOTH, RB_OPAQUE);
+    }
+    /* pareti (la stanza va da 1 a RW-1 caselle) */
+    rwall(TS, TS, W - TS, TS, wtex, wall, wain);
+    rwall(W - TS, TS, W - TS, H - TS, wtex, wall, wain);
+    rwall(W - TS, H - TS, TS, H - TS, wtex, wall, wain);
+    rwall(TS, H - TS, TS, TS, wtex, wall, wain);
+    /* soffitto con travi */
+    TEXS(TX_WOOD, 14);
+    {
+        Lt lc = light_point(W / 2, H / 2, 1);
+        uint32_t cc = litv(RGB(70, 52, 40), lc, 0.6f);
+        emit_quad(v3(TS, RCEIL, TS), v3(TS, RCEIL, H - TS), v3(W - TS, RCEIL, H - TS), v3(W - TS, RCEIL, TS), cc, cc, cc, cc, 0, 0, 0, 4, 5, 4, 5, 0, TX_WOOD, RB_OPAQUE);
+    }
+    light_at(W / 2, H / 2);
+    for (k = 1; k < RW - 1; k++) box(k * TS + TS * 0.5f, RCEIL - 2.4f, H / 2, 1.0f, 2.4f, H / 2 - TS, 0, wood, shade(wood, 0.7f), 1, 0);
+    /* pilastri agli angoli e montanti di legno */
+    for (k = 0; k < 4; k++) {
+        float px = (k & 1) ? W - TS - 1.2f : TS + 1.2f, pz = (k & 2) ? H - TS - 1.2f : TS + 1.2f;
+        light_at(px, pz);
+        TEXS(roomType == 1 ? TX_STONE : TX_WOOD, 10);
+        box(px, 0, pz, 1.4f, RCEIL, 1.4f, 0, roomType == 1 ? RGB(140, 136, 140) : wood, shade(wood, 0.7f), 1, 0);
+    }
+    /* porta d'uscita sulla parete sud, con lo spiraglio di luce lunare */
+    light_at(W / 2, H - TS - 2);
+    TEXS(TX_STONE, 8);
+    box(W / 2, 0, H - TS - 0.4f, 4.6f, 16, 0.5f, 0, RGB(120, 116, 118), RGB(120, 116, 118), 1, 0);
+    TEXS(TX_WOOD, 8);
+    box(W / 2, 0.2f, H - TS - 0.9f, 3.4f, 13.4f, 0.25f, 0, RGB(104, 72, 50), RGB(104, 72, 50), 1, 0);
+    glow(W / 2, 1, H - TS - 1.5f, 6, rgba(RGB(120, 140, 200), 90));
+    /* finestre con la luna (o vetrata colorata nella cappella) */
+    for (k = 0; k < 2; k++) {
+        float wx = k ? W - TS - 0.3f : TS + 0.3f, wz = H / 2 - 6;
+        uint32_t wc = RGB(70, 86, 130);
+        if (roomType == 1) continue;
+        light_at(wx, wz);
+        TEXS(TX_WINDOW, 0);
+        box(wx, 17, wz, 0.12f, 9, 3.4f, 0, wc, wc, 1, 1);
+        glow(wx + (k ? -3 : 3), 21, wz, 8, rgba(RGB(90, 110, 170), 70));
+    }
+    if (roomType == 1) {
+        /* vetrata dietro l'altare e raggi di luce colorata fino al pavimento */
+        TEXS(TX_WINDOW, 0);
+        box(W / 2, 14, TS + 0.3f, 6.5f, 22, 0.12f, 0, RGB(255, 200, 150), RGB(255, 200, 150), 1, 1);
+        for (k = 0; k < 3; k++) {
+            float ox = (k - 1) * 4.0f;
+            uint32_t rc = k == 0 ? RGB(120, 60, 160) : (k == 1 ? RGB(200, 150, 70) : RGB(60, 90, 170));
+            V3 a = v3(W / 2 + ox - 2, 30, TS + 0.5f), b = v3(W / 2 + ox + 2, 30, TS + 0.5f);
+            V3 c = v3(W / 2 + ox * 2.2f + 5, 0.3f, TS + 40), d = v3(W / 2 + ox * 2.2f - 5, 0.3f, TS + 40);
+            emit_quad(a, b, c, d, rgba(rc, 60), rgba(rc, 60), rgba(rc, 0), rgba(rc, 0), 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, TX_WHITE, RB_ADD);
+        }
+    }
+    /* arredi */
+    switch (roomType) {
+    case 0:
+        light_at(3.5f * TS, 1.6f * TS);
+        TEXS(TX_WOOD, 10);
+        box(3.5f * TS, 0, 1.55f * TS, 23, 5.6f, 3.2f, 0, wood, shade(wood, 0.7f), 1, 0);             /* bancone */
+        box(3.5f * TS, 5.6f, 1.55f * TS, 23.5f, 0.6f, 3.6f, 0, shade(wood, 1.15f), wood, 1, 0);
+        for (k = 0; k < 5; k++) rbarrel(1.8f * TS + k * 9, 1.12f * TS, 5.5f);                         /* botti dietro al bancone */
+        for (k = 0; k < 2; k++) {
+            float tx2 = (2.5f + k * 2) * TS, tz2 = 3.5f * TS;
+            light_at(tx2, tz2);
+            rtable(tx2, tz2, 5.5f, 4, wood);
+            rcandle(tx2 + 1, 5.6f, tz2, 1.4f, k * 13);
+            rbarrel(tx2 - 7, tz2 + 5, 3.2f); rbarrel(tx2 + 7, tz2 - 4, 3.2f);                          /* sgabelli */
+        }
+        /* camino sulla parete ovest */
+        light_at(TS + 3, 3 * TS);
+        TEXS(TX_STONE, 8);
+        box(TS + 2.2f, 0, 3 * TS, 2.2f, 14, 7, 0, RGB(120, 112, 108), RGB(100, 96, 94), 1, 0);
+        box(TS + 3.0f, 0, 3 * TS, 1.6f, 7, 4.6f, 0, RGB(20, 16, 14), RGB(20, 16, 14), 1, 0);
+        flame(TS + 4, 2, 3 * TS, 2.2f, 7); flame(TS + 4, 2, 3 * TS + 2, 1.6f, 9);
+        glow(TS + 6, 4, 3 * TS, 16, rgba(RGB(255, 120, 40), 120));
+        /* lanterne appese */
+        for (k = 0; k < 2; k++) {
+            float lx = (2.5f + k * 2) * TS, lz = 3.5f * TS;
+            pb_x = lx; pb_z = lz; pb_c = 1; pb_s = 0; pb_rolling = 0; pb_y = 0;
+            TEXS(TX_METAL, 6);
+            limbL(0, 31, 0, 0, RCEIL, 0, 0.12f, 0.12f, RGB(50, 48, 46));
+            TEXS(TX_WHITE, 32);
+            box(lx, 28, lz, 1.2f, 3, 1.2f, 0.785f, RGB(255, 200, 120), RGB(255, 220, 160), 1, 1);
+            glow(lx, 29.5f, lz, 12, rgba(RGB(255, 170, 80), 120));
+        }
+        break;
+    case 1:
+        light_at(3.5f * TS, 1.5f * TS);
+        TEXS(TX_STONE, 8);
+        box(3.5f * TS, 0, 1.5f * TS, 9, 1.2f, 6, 0, RGB(130, 126, 130), RGB(120, 116, 120), 1, 0);     /* gradino */
+        box(3.5f * TS, 1.2f, 1.45f * TS, 6.5f, 6, 3.2f, 0, RGB(150, 146, 150), RGB(140, 136, 140), 1, 0); /* altare */
+        TEXS(TX_CLOTH, 4);
+        box(3.5f * TS, 7.2f, 1.45f * TS, 6.8f, 0.3f, 3.4f, 0, RGB(200, 190, 170), RGB(150, 30, 30), 1, 0);
+        for (k = 0; k < 5; k++) rcandle(3.5f * TS - 5 + k * 2.5f, 7.5f, 1.45f * TS + ((k & 1) ? 1.2f : -1.2f), 1.2f + (k % 3) * 0.6f, k * 5);
+        for (k = 0; k < 2; k++) {   /* candelabri alti ai lati */
+            float cx2 = k ? 5.6f * TS : 1.4f * TS;
+            pb_x = cx2; pb_z = 1.4f * TS; pb_c = 1; pb_s = 0; pb_rolling = 0; pb_y = 0;
+            TEXS(TX_METAL, 6); mat_metal = 1;
+            limb_taper = 0.4f; limbL(0, 0, 0, 0, 2, 0, 1.6f, 1.6f, RGB(160, 130, 80)); limb_taper = 1.0f;
+            limbL(0, 2, 0, 0, 12, 0, 0.3f, 0.3f, RGB(160, 130, 80));
+            mat_metal = 0;
+            rcandle(cx2, 12, 1.4f * TS, 2.2f, 31 + k);
+        }
+        for (k = 0; k < 4; k++) {   /* panche */
+            float bx3 = (k & 1) ? 4.95f * TS : 2.05f * TS, bz3 = (k < 2 ? 3.5f : 4.4f) * TS;
+            light_at(bx3, bz3);
+            TEXS(TX_WOOD, 8);
+            box(bx3, 3.2f, bz3, 11, 0.6f, 2.4f, 0, wood, shade(wood, 0.7f), 1, 0);
+            box(bx3, 3.8f, bz3 + 2.2f, 11, 4.2f, 0.4f, 0, wood, shade(wood, 0.7f), 1, 0);
+            box(bx3 - 10, 0, bz3, 0.5f, 3.2f, 2.2f, 0, shade(wood, 0.8f), shade(wood, 0.7f), 1, 0);
+            box(bx3 + 10, 0, bz3, 0.5f, 3.2f, 2.2f, 0, shade(wood, 0.8f), shade(wood, 0.7f), 1, 0);
+        }
+        break;
+    case 2:
+        /* letto */
+        light_at(5.5f * TS, 2 * TS);
+        TEXS(TX_WOOD, 8);
+        box(5.5f * TS - 2, 0, 2 * TS - 2, 6.5f, 3.2f, 13, 0, wood, shade(wood, 0.7f), 1, 0);
+        box(5.5f * TS - 2, 0, TS + 2, 6.5f, 9, 0.8f, 0, shade(wood, 0.9f), shade(wood, 0.7f), 1, 0);
+        TEXS(TX_CLOTH, 4);
+        box(5.5f * TS - 2, 3.2f, 2 * TS - 1, 6.0f, 1.4f, 12, 0, RGB(176, 168, 150), RGB(150, 140, 120), 1, 0);
+        box(5.5f * TS - 2, 4.0f, 2 * TS + 3, 6.2f, 0.9f, 8, 0, RGB(110, 40, 40), RGB(90, 30, 30), 1, 0);    /* coperta */
+        pb_x = 5.5f * TS - 2; pb_z = TS + 5; pb_c = 1; pb_s = 0; pb_rolling = 0; pb_y = 0;
+        blobL(0, 5.2f, 0, 2.2f, 1.0f, 4.5f, RGB(200, 194, 180), 3, 8);                                     /* cuscino */
+        /* tavolo con candela, sedia */
+        light_at(2.5f * TS, 2.5f * TS);
+        rtable(2.5f * TS, 2.5f * TS, 5, 4, wood);
+        rcandle(2.5f * TS, 5.6f, 2.5f * TS, 1.6f, 3);
+        rbarrel(2.5f * TS + 7, 2.5f * TS + 4, 3.2f);
+        /* scaffale con libri */
+        light_at(1.5f * TS, 1.5f * TS);
+        TEXS(TX_WOOD, 8);
+        box(1.3f * TS, 0, 1.5f * TS, 2.5f, 20, 7, 0, shade(wood, 0.8f), shade(wood, 0.6f), 1, 0);
+        TEXS(TX_WHITE, 32);
+        for (k = 0; k < 12; k++) {
+            unsigned hb = hash2(hs + k, 77);
+            uint32_t bc = (hb % 3 == 0) ? RGB(120, 40, 40) : ((hb % 3 == 1) ? RGB(50, 70, 50) : RGB(60, 50, 90));
+            box(1.3f * TS + 2.6f, 4 + (k / 4) * 5.5f, 1.5f * TS - 5.5f + (k % 4) * 3.4f, 0.5f, 3.2f + (hb % 3) * 0.4f, 1.2f, 0, lit(bc, 1), lit(bc, 0.8f), 1, 1);
+        }
+        /* camino */
+        light_at(TS + 3, 3.5f * TS);
+        TEXS(TX_STONE, 8);
+        box(TS + 2.2f, 0, 3.5f * TS, 2.2f, 14, 7, 0, RGB(120, 112, 108), RGB(100, 96, 94), 1, 0);
+        box(TS + 3.0f, 0, 3.5f * TS, 1.6f, 7, 4.6f, 0, RGB(20, 16, 14), RGB(20, 16, 14), 1, 0);
+        flame(TS + 4, 2, 3.5f * TS, 2.0f, 11);
+        glow(TS + 6, 4, 3.5f * TS, 15, rgba(RGB(255, 120, 40), 120));
+        break;
+    default:
+        /* forgia */
+        light_at(1.5f * TS, 1.6f * TS);
+        TEXS(TX_BRICK, 8);
+        box(1.6f * TS, 0, 1.55f * TS, 10, 7, 5.5f, 0, RGB(130, 90, 78), RGB(110, 80, 70), 1, 0);
+        TEXS(TX_WHITE, 32);
+        box(1.6f * TS, 7, 1.55f * TS, 7, 0.4f, 3.5f, 0, RGB(255, 120, 40), RGB(255, 150, 70), 1, 1);
+        flame(1.6f * TS - 3, 7.4f, 1.55f * TS, 1.6f, 21); flame(1.6f * TS + 3, 7.4f, 1.55f * TS, 1.4f, 23);
+        glow(1.6f * TS, 9, 1.55f * TS, 20, rgba(RGB(255, 110, 30), 140));
+        TEXS(TX_BRICK, 8);
+        box(1.6f * TS, 7, 1.15f * TS, 4, 30, 3, 0, RGB(120, 84, 74), RGB(100, 74, 66), 1, 0);              /* cappa */
+        /* incudine */
+        light_at(4.5f * TS, 2.5f * TS);
+        TEXS(TX_METAL, 6); mat_metal = 1;
+        box(4.5f * TS, 0, 2.5f * TS, 2, 3.6f, 2, 0, RGB(80, 78, 80), RGB(60, 58, 60), 1, 0);
+        box(4.5f * TS, 3.6f, 2.5f * TS, 4.5f, 1.6f, 1.8f, 0, RGB(100, 100, 106), RGB(80, 80, 86), 1, 0);
+        mat_metal = 0;
+        /* rastrelliera con spade e asce */
+        light_at(5.5f * TS, 1.4f * TS);
+        TEXS(TX_WOOD, 8);
+        box(5.5f * TS, 0, 1.2f * TS, 7, 1, 1.5f, 0, wood, shade(wood, 0.7f), 1, 0);
+        box(5.5f * TS, 12, 1.2f * TS, 7, 0.8f, 1.5f, 0, wood, shade(wood, 0.7f), 1, 0);
+        pb_x = 5.5f * TS; pb_z = 1.25f * TS; pb_c = 1; pb_s = 0; pb_rolling = 0; pb_y = 0;
+        TEXS(TX_METAL, 6); mat_metal = 1;
+        for (k = 0; k < 5; k++) {
+            float ox = -5.5f + k * 2.75f;
+            limb_taper = 0.35f;
+            limbL(ox, 1.0f, 0, ox, 14 + (k & 1) * 2, 0, 0.12f, 0.5f, RGB(200, 204, 214));
+            limb_taper = 1.0f;
+            limbL(ox - 1.2f, 3.0f, 0, ox + 1.2f, 3.0f, 0, 0.25f, 0.25f, RGB(170, 140, 90));
+        }
+        mat_metal = 0;
+        for (k = 0; k < 3; k++) rbarrel(4.7f * TS + k * 6, 4.5f * TS, 6);
+        break;
+    }
+    /* baule */
+    if (roomChestX >= 0) {
+        float cx2 = (roomChestX + 0.5f) * TS, cz2 = (roomChestY + 0.5f) * TS;
+        light_at(cx2, cz2);
+        TEXS(TX_WOOD, 8);
+        box(cx2, 0, cz2, 4.5f, 4.2f, 3.0f, 0, RGB(110, 76, 50), RGB(90, 62, 42), 1, 0);
+        if (roomChestOpen) box(cx2, 4.2f, cz2 - 3.4f, 4.5f, 4.0f, 0.5f, 0, RGB(110, 76, 50), RGB(90, 62, 42), 1, 0);
+        else box(cx2, 4.2f, cz2, 4.6f, 1.4f, 3.1f, 0, RGB(120, 84, 56), RGB(100, 70, 46), 1, 0);
+        TEXS(TX_METAL, 6);
+        box(cx2 - 2.6f, 0, cz2, 0.4f, 5.7f, 3.2f, 0, RGB(170, 140, 80), RGB(150, 120, 70), 1, 0);
+        box(cx2 + 2.6f, 0, cz2, 0.4f, 5.7f, 3.2f, 0, RGB(170, 140, 80), RGB(150, 120, 70), 1, 0);
+        if (!roomChestOpen) glow(cx2, 6, cz2, 7 + sinf(frame * 0.1f), rgba(RGB(255, 200, 110), 70));
+    }
+    /* pulviscolo nella luce */
+    for (k = 0; k < 18; k++) {
+        float px = TS + 4 + (float)(hash2(k, 51) % (unsigned)(W - 2 * TS - 8)), pz = TS + 4 + (float)(hash2(k, 53) % (unsigned)(H - 2 * TS - 8));
+        float py = 4 + fmodf(frame * 0.04f + (hash2(k, 55) % 30), 30.0f);
+        glow(px + sinf(frame * 0.013f + k) * 3, py, pz + cosf(frame * 0.011f + k) * 3, 0.6f, rgba(RGB(255, 220, 170), 80));
+    }
+    TEXS(TX_WHITE, 32);
+}
+
+/* ---- meta: colonna di luce nel mondo e bussola ---- */
+static void draw_waypoint_beacon(void)
+{
+    float x, z, dx, dz, gh;
+    if (!wpOn || inRoom) return;
+    x = (wpX - WX0) * TS + 8.0f; z = (wpY - WY0) * TS + 8.0f;
+    dx = x - P.x; dz = z - P.y;
+    if (dx * dx + dz * dz < 18 * 18) { wpOn = 0; set_msg("META RAGGIUNTA", 120); return; }
+    if (x < 0 || z < 0 || x > MW * TS || z > MH * TS) return;
+    gh = ground_h(x, z);
+    {
+        V3 a = v3(x - camR.x * 2.5f, gh, z - camR.z * 2.5f), b = v3(x + camR.x * 2.5f, gh, z + camR.z * 2.5f);
+        V3 c = v3(x + camR.x * 1.2f, gh + 160, z + camR.z * 1.2f), d = v3(x - camR.x * 1.2f, gh + 160, z - camR.z * 1.2f);
+        emit_quad(a, b, c, d, rgba(RGB(255, 210, 120), 150), rgba(RGB(255, 210, 120), 150), rgba(RGB(255, 180, 90), 0), rgba(RGB(255, 180, 90), 0),
+                  0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, TX_WHITE, RB_ADD);
+        cur_gy = 0;
+        glow(x, gh + 3, z, 10 + sinf(frame * 0.1f) * 2, rgba(RGB(255, 200, 110), 180));
+    }
+}
+static void draw_compass(void)
+{
+    float dx, dz, ang, d;
+    int cx = SW / 2, y = 30, mx;
+    char b[24], n[12];
+    if (!wpOn || inRoom) return;
+    dx = (wpX - WX0) * TS + 8.0f - P.x; dz = (wpY - WY0) * TS + 8.0f - P.y;
+    d = sqrtf(dx * dx + dz * dz);
+    ang = atan2f(dx * camFz - dz * camFx, dx * camFx + dz * camFz);      /* angolo rispetto a dove guarda la telecamera */
+    rectf(cx - 70, y, 140, 1, rgba(GOLDD, 200));
+    rectf(cx, y - 3, 1, 7, rgba(GOLD, 220));
+    mx = cx + (int)(-ang / PI * 70);
+    if (mx < cx - 70) mx = cx - 70;
+    if (mx > cx + 70) mx = cx + 70;
+    diamond(mx, y, 4, RGB(255, 200, 110), rgba(RGB(30, 20, 10), 220));
+    strcpy(b, ""); itoa_s((int)(d * 0.147f), n); strcat(b, n); strcat(b, " M");
+    text(mx - text_w(b, 1) / 2, y + 7, 1, RGB(235, 215, 170), b);
+}
+
 /* rettangoli di una riga uniti quando il colore e' lo stesso: molti meno elementi da disegnare */
 static void map_row(int x0, int y, int n, int cs, const uint32_t *cols)
 {
@@ -5257,6 +5808,18 @@ static void map_row(int x0, int y, int n, int cs, const uint32_t *cols)
         rectf(x0 + i * cs, y, (j - i) * cs, cs, cols[i]);
         i = j;
     }
+}
+static void map_flag(int x, int y)
+{
+    rectf(x, y - 9, 1, 10, RGB(240, 230, 210));
+    rectf(x + 1, y - 9, 5, 3, (frame & 8) ? RGB(255, 200, 100) : RGB(255, 150, 60));
+    diamond(x, y, 2, RGB(255, 200, 110), 0);
+}
+static void map_cursor(int x, int y)
+{
+    uint32_t c = RGB(255, 255, 255);
+    rectf(x - 6, y, 4, 1, c); rectf(x + 3, y, 4, 1, c);
+    rectf(x, y - 6, 1, 4, c); rectf(x, y + 3, 1, 4, c);
 }
 static void map_marker(int x, int y, int r, uint32_t c)
 {
@@ -5294,6 +5857,9 @@ static void draw_map(void)
         map_marker(MX + (int)((COREX + CX0 + CITYW / 2) * k), MY + (int)((COREY + CY0 + CITYH / 2) * k), 2, RGB(240, 220, 170));
         for (i = 0; i < nbraz; i++) if (braz[i].lit) rectf(MX + (int)(braz[i].tx * k) - 1, MY + (int)(braz[i].ty * k) - 1, 3, 3, RGB(255, 150, 50));
         for (i = 0; i < NRB; i++) if (!(RB[i].state == RS_DEAD)) map_marker(MX + (int)(((int)(RB[i].x / TS) + WX0) * k), MY + (int)(((int)(RB[i].y / TS) + WY0) * k), 1, RGB(210, 40, 40));
+        /* meta e cursore */
+        if (wpOn) map_flag(MX + (int)(wpX * k), MY + (int)(wpY * k));
+        map_cursor(MX + (int)(mapCurX * k), MY + (int)(mapCurY * k));
         /* giocatore: punto lampeggiante con direzione */
         {
             int px = MX + (int)(pgx * k), py = MY + (int)(pgy * k);
@@ -5344,6 +5910,16 @@ static void draw_map(void)
             }
             {
                 int px = MX + (int)(HALF * k), py = MY + (int)(HALF * k);
+                float cxl = mapCurX - WX0 - ox, cyl = mapCurY - WY0 - oy;
+                if (wpOn) {
+                    float wxl = wpX - WX0 - ox, wyl = wpY - WY0 - oy;
+                    if (wxl >= 0 && wyl >= 0 && wxl < HALF * 2 && wyl < HALF * 2) map_flag(MX + (int)(wxl * k), MY + (int)(wyl * k));
+                }
+                if (cxl < 0) { cxl = 0; mapCurX = WX0 + ox; }
+                if (cyl < 0) { cyl = 0; mapCurY = WY0 + oy; }
+                if (cxl > HALF * 2 - 1) { cxl = HALF * 2 - 1; mapCurX = WX0 + ox + cxl; }
+                if (cyl > HALF * 2 - 1) { cyl = HALF * 2 - 1; mapCurY = WY0 + oy + cyl; }
+                map_cursor(MX + (int)(cxl * k), MY + (int)(cyl * k));
                 map_marker(px, py, 2, (frame & 16) ? RGB(255, 255, 255) : RGB(255, 210, 120));
                 rectf(px + (int)(P.fx * 6) - 1, py + (int)(P.fy * 6) - 1, 2, 2, RGB(255, 255, 255));
             }
@@ -5359,9 +5935,11 @@ static void draw_map(void)
         rectf(lx - 1, ly + 55, 3, 1, RGB(150, 128, 96)); text(lx + 8, ly + 52, 1, RGB(220, 210, 190), "STRADA");
         if (P.region >= 0) {
             const char *rn = region_name_now();
-            text(lx - 2, ly + 78, 1, RGB(170, 160, 140), "TI TROVI A");
-            text(lx - 2, ly + 90, 1, RGB(235, 215, 180), rn);
+            text(lx - 2, ly + 84, 1, RGB(170, 160, 140), "TI TROVI A");
+            text(lx - 2, ly + 96, 1, RGB(235, 215, 180), rn);
         }
+        diamond(lx, ly + 68, 3, RGB(255, 200, 110), 0); text(lx + 8, ly + 65, 1, RGB(220, 210, 190), "META");
+        text(lx - 2, MY + SZ - 34, 1, RGB(160, 150, 135), wpOn ? "X  SPOSTA/TOGLI META" : "X  METTI LA META");
         text(lx - 2, MY + SZ - 22, 1, RGB(160, 150, 135), mapZoom ? "TRIANGOLO  MONDO" : "TRIANGOLO  DINTORNI");
         text(lx - 2, MY + SZ - 10, 1, RGB(160, 150, 135), "SELECT  CHIUDI");
     }
@@ -5423,12 +6001,16 @@ static void draw_hud(void)
         diamond(84, SH - 26, 4, GOLD, rgba(RGB(30, 20, 20), 220));
     }
     /* Braci Primeve raccolte */
+    draw_compass();
     for (i = 0; i < 4; i++) diamond(52 + i * 11, 38, 4, GOLD, i < embers ? RGB(255, 140, 50) : rgba(RGB(30, 24, 20), 220));
     if (mode == M_PLAY) {
         float gx = (CX0 + 66 + COREX - WX0) * TS + 8.0f - P.x, gy = (CY0 + 36 + COREY - WY0) * TS + 8.0f - P.y;
         const char *pr = 0;
-        if (embers < 4 && gx * gx + gy * gy < 50 * 50) pr = "IL CANCELLO E' SIGILLATO: SERVONO 4 BRACI PRIMEVE";
+        float ox, oy; unsigned did;
+        if (inRoom) pr = room_near_chest() ? "SELECT  APRI IL BAULE" : (room_near_exit() ? "SELECT  ESCI" : 0);
+        else if (embers < 4 && gx * gx + gy * gy < 50 * 50) pr = "IL CANCELLO E' SIGILLATO: SERVONO 4 BRACI PRIMEVE";
         else if (near_npc() && near_brazier() < 0) pr = "SELECT  PARLA CON LA GUARDIANA";
+        else if (near_brazier() < 0 && door_near(&ox, &oy, &did)) pr = "SELECT  ENTRA";
         if (pr) {
             int tw = text_w(pr, 2);
             rectf((SW - tw) / 2 - 12, SH - 62, tw + 24, 17, rgba(RGB(8, 6, 8), 170));
@@ -5770,7 +6352,8 @@ static void draw_npc(void)
     gh = ground_h(x, z);
     ang = atan2f(P.y - z, P.x - x);
     light_at(x, z);
-    cur_gy = gh; shadow(x, z, 5); cur_gy = 0;
+    cur_gy = gh; shadow(x, z, 3); cur_gy = 0;
+    pb_sc = CS;
     pb_x = x; pb_z = z; pb_c = cosf(ang); pb_s = sinf(ang); pb_rolling = 0; pb_y = gh;
     TEXS(TX_CLOTH, 8);
     limb_taper = 0.6f;
@@ -5813,29 +6396,41 @@ void game_render(void)
     fx = cosf(camYaw); fz = sinf(camYaw);
     tx = camX; tz = camZ;
     if (shake > 0) { tx += (float)((int)(rnd() % 5) - 2); tz += (float)((int)(rnd() % 5) - 2); }
-    {
+    if (inRoom) {
+        /* telecamera degli interni: piu' vicina e alta, sempre dentro la stanza e sotto il soffitto */
+        float cp = cosf(camPitch + 0.06f), sp = sinf(camPitch + 0.06f), dist = 32;
+        float ex2 = tx - fx * cp * dist, ez2 = tz - fz * cp * dist, ey2 = 9 + sp * dist;
+        if (ex2 < TS + 3) ex2 = TS + 3;
+        if (ex2 > (RW - 1) * TS - 3) ex2 = (RW - 1) * TS - 3;
+        if (ez2 < TS + 3) ez2 = TS + 3;
+        if (ez2 > (RH - 1) * TS - 3) ez2 = (RH - 1) * TS - 3;
+        if (ey2 > RCEIL - 4) ey2 = RCEIL - 4;
+        tgt = v3(tx, 8, tz);
+        eye = v3(ex2, ey2, ez2);
+        hd = 0; (void)hd;
+    } else {
         /* telecamera alle spalle con collisione contro gli edifici */
-        float want = 62.0f + 16.0f * cmbAmt, t, dist, cp = cosf(camPitch + 0.12f * cmbAmt), sp = sinf(camPitch + 0.12f * cmbAmt);
+        float want = 34.0f + 11.0f * cmbAmt, t, dist, cp = cosf(camPitch + 0.12f * cmbAmt), sp = sinf(camPitch + 0.12f * cmbAmt);
 #ifdef GAME_DEBUG
         if (dbg_cam > 0) want = dbg_cam;
 #endif
         float lx, ly, ox = tx, oz = tz;
         if (P.lock != -1 && lock_pos(&lx, &ly)) { ox = tx + (lx - tx) * 0.25f; oz = tz + (ly - tz) * 0.25f; }
         camGY += (ground_h(P.x, P.y) - camGY) * 0.2f;
-        tgt = v3(ox, 16 + camGY, oz);
+        tgt = v3(ox, 9 + camGY, oz);
         dist = want;
         for (t = 6; t <= want; t += 2) {
-            float px = ox - fx * cp * t, pz = oz - fz * cp * t, py = 16 + camGY + sp * t;
+            float px = ox - fx * cp * t, pz = oz - fz * cp * t, py = 9 + camGY + sp * t;
             int ttx = (int)floorf(px / TS), ttz = (int)floorf(pz / TS);
             int wall = ttx < 0 || ttz < 0 || ttx >= MW || ttz >= MH || map[ttz][ttx] == T_WALL || map[ttz][ttx] == T_RUIN;
             if ((wall && py < 52 + ground_h(px, pz)) || py < ground_h(px, pz) + 4 ||
                 (ttx >= 0 && ttz >= 0 && ttx < MW && ttz < MH && map[ttz][ttx] == T_ROCK &&
                  py < (hgt[ttz][ttx] > hgt[ttz + 1][ttx + 1] ? hgt[ttz][ttx] : hgt[ttz + 1][ttx + 1]) + 14)) { dist = t - 5; break; }
         }
-        if (dist < 22) dist = 22;
+        if (dist < 14) dist = 14;
         if (dist < camDistS) camDistS = dist; else camDistS += (dist - camDistS) * 0.08f;
         hd = camDistS * cp;
-        eye = v3(ox - fx * hd, 16 + camGY + camDistS * sp + (want - camDistS) * 0.9f, oz - fz * hd);
+        eye = v3(ox - fx * hd, 9 + camGY + camDistS * sp + (want - camDistS) * 0.9f, oz - fz * hd);
     }
     {   /* assi della telecamera per i billboard */
         float dx = tgt.x - eye.x, dy = tgt.y - eye.y, dz = tgt.z - eye.z, l = sqrtf(dx * dx + dy * dy + dz * dz);
@@ -5858,8 +6453,10 @@ void game_render(void)
             int r = (int)(26 + (58 - 26) * rk + 120 * fl), g = (int)(30 + (66 - 30) * rk + 125 * fl), b = (int)(42 + (64 - 42) * rk + 130 * fl);
             fc = RGB(r > 255 ? 255 : r, g > 255 ? 255 : g, b > 255 ? 255 : b);
         } else fc = RGB(96, 80, 84);
-        r_begin(fc, eye, tgt, 70 - 20 * rainAmt, 270 - 50 * rainAmt, fc);
+        if (inRoom) r_begin(RGB(8, 6, 5), eye, tgt, 80, 260, RGB(8, 6, 5));
+        else r_begin(fc, eye, tgt, 70 - 20 * rainAmt, 270 - 50 * rainAmt, fc);
     }
+    if (inRoom) goto room_scene;
 
     {   /* luna velata nel cielo (additiva: la nebbia non la copre) */
         float ma = -0.9f, mx = eye.x + cosf(ma) * 320, mz = eye.z + sinf(ma) * 320, my = eye.y + 170;
@@ -5877,6 +6474,7 @@ void game_render(void)
         }
     }
     draw_world(tx + fx * 100, tz + fz * 100);
+    draw_waypoint_beacon();
     draw_blood();
     for (i = 0; i < nbraz; i++) draw_brazier(i);
     cur_gy = 0;
@@ -5908,12 +6506,15 @@ void game_render(void)
     rim_on = perf_lvl < 2;
     for (i = 0; i < NE; i++) if (E[i].alive) draw_enemy(&E[i]);
     lo_detail = 0; caps_near = 0;
-    caps_near = 1;
+    caps_near = 1; pb_sc = 1;
     if (Bs.state != BS_OFF || !Bs.dead) draw_boss();
     rb_draw();
-    caps_near = 0;
+    caps_near = 0; pb_sc = 1;
     draw_npc();
+room_scene:
+    if (inRoom) draw_room();
     draw_player();
+    pb_sc = 1;
     rim_on = 0;
     for (i = 0; i < MAXPART; i++)
         if (parts[i].life > 0) {
@@ -5929,7 +6530,7 @@ void game_render(void)
         }
     cur_gy = 0;
     /* pulviscolo nell'aria: braci in citta', cenere fuori, che salgono e ondeggiano attorno al giocatore */
-    {
+    if (!inRoom) {
         int intown = in_town((int)(P.x / TS), (int)(P.y / TS));
         cur_gy = 0;
         for (i = 0; i < (perf_lvl ? 16 : 36); i++) {
@@ -5944,7 +6545,7 @@ void game_render(void)
         }
     }
     if (shockT > 0) {
-        float k = shockT / 16.0f, r0 = (1 - k) * 34, gh2 = ground_h(shockX, shockY);
+        float k = shockT / 16.0f, r0 = (1 - k) * 22, gh2 = ground_h(shockX, shockY);
         cur_gy = gh2;
         fan(shockX, shockY, 0.8f, r0, r0 + 3 + 3 * k, 0, 2 * PI, rgba(RGB(255, 170, 90), (int)(200 * k)), 20);
         glow(shockX, 3, shockY, 14 + (1 - k) * 10, rgba(RGB(255, 120, 40), (int)(150 * k)));
@@ -5960,7 +6561,7 @@ void game_render(void)
             cur_gy = 0;
         }
     /* pioggia: gocce allungate attorno alla telecamera e schizzi a terra */
-    if (rainAmt > 0.02f) {
+    if (rainAmt > 0.02f && !inRoom) {
         int nd = (int)((perf_lvl ? 40 : 90) * rainAmt);
         float cx = tgt.x, cz = tgt.z, gyc = ground_h(P.x, P.y);
         cur_gy = 0;
@@ -6105,6 +6706,9 @@ static void teleport_w(int wx, int wy)
     P.x = (wx - WX0) * TS + 8; P.y = (wy - WY0) * TS + 8;
     camX = P.x; camZ = P.y;
 }
+void game_debug_room(unsigned id) { if (inRoom) room_exit(); room_enter(id, P.x, P.y); }
+int game_debug_inroom(void) { return inRoom; }
+int game_debug_door(void) { float ox, oy; unsigned d; return door_near(&ox, &oy, &d); }
 void game_debug_boss(void)
 {
     embers = 4; P.iframes = 100000;
@@ -6113,6 +6717,7 @@ void game_debug_boss(void)
 }
 void game_debug_teleport(int where)
 {
+    inRoom = 0; nrl = 0;
     P.iframes = 100000; P.hp = (float)maxhp();
     switch (where) {
     case 1: teleport_w(COREX + CX0 + 69, COREY + CY0 + 36); break;
