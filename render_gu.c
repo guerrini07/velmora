@@ -9,7 +9,7 @@
 #define BUF_W 512
 #define SCR_W 480
 #define SCR_H 272
-#define MAXTEX 16
+#define MAXTEX 17
 
 /* lista dei comandi grafici: contiene anche i vertici di ogni frame, quindi va dimensionata larga */
 #define LIST_WORDS (1024 * 1024)
@@ -21,8 +21,8 @@ typedef struct { float u, v; uint32_t color; float x, y, z; } GV;
 typedef struct { uint32_t color; short x, y, z; } SV;
 
 #define VFMT (GU_TEXTURE_32BITF | GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_3D)
-#define OPQ_MAX 1500    /* vertici per contenitore opaco (multiplo di 3) */
-#define TRN_MAX 1500    /* trasparenti e additivi: disegnati a fine scena */
+#define OPQ_MAX 6000    /* vertici per contenitore opaco (multiplo di 3) */
+#define TRN_MAX 2400    /* trasparenti e additivi: disegnati a fine scena */
 #define RECT_MAX 1024
 
 static GV opq[MAXTEX][OPQ_MAX]; static int nopq[MAXTEX];
@@ -35,18 +35,97 @@ static int curtex = -1;
 
 #define UNCACHED(p) ((void *)((uintptr_t)(p) | 0x40000000))
 
+/* mipmap: versioni ridotte di ogni texture (1/2, 1/4, 1/8) per le superfici lontane:
+ * niente sfarfallio e meno accessi alla memoria */
+#define NMIP 3
+static uint32_t *mips[MAXTEX][NMIP];
+static uint32_t mipbuf[MAXTEX * (64 * 64 + 32 * 32 + 16 * 16)] __attribute__((aligned(16)));
+static int mip_ok;
+
+static void build_mips(void)
+{
+    int t, l, x, y, sz, used = 0;
+    mip_ok = texsize == 128 && texcount <= MAXTEX;
+    if (!mip_ok) return;
+    for (t = 0; t < texcount; t++) {
+        const uint32_t *src = texpix + t * texsize * texsize;
+        sz = texsize;
+        for (l = 0; l < NMIP; l++) {
+            int ns = sz / 2;
+            uint32_t *dst = mipbuf + used;
+            mips[t][l] = dst;
+            used += ns * ns;
+            for (y = 0; y < ns; y++)
+                for (x = 0; x < ns; x++) {
+                    uint32_t a = src[(y * 2) * sz + x * 2], b = src[(y * 2) * sz + x * 2 + 1];
+                    uint32_t c = src[(y * 2 + 1) * sz + x * 2], d = src[(y * 2 + 1) * sz + x * 2 + 1];
+                    uint32_t o = 0;
+                    int k;
+                    for (k = 0; k < 32; k += 8) {
+                        uint32_t v = (((a >> k) & 255) + ((b >> k) & 255) + ((c >> k) & 255) + ((d >> k) & 255) + 2) / 4;
+                        o |= v << k;
+                    }
+                    dst[y * ns + x] = o;
+                }
+            src = dst; sz = ns;
+        }
+    }
+}
+
 static void bind_tex(int t)
 {
     if (t == curtex) return;
     curtex = t;
     sceGuTexImage(0, texsize, texsize, texsize, texpix + t * texsize * texsize);
+    if (mip_ok) {
+        int l, sz = texsize / 2;
+        for (l = 0; l < NMIP; l++, sz /= 2) sceGuTexImage(l + 1, sz, sz, sz, mips[t][l]);
+    }
     sceGuTexFlush();
+}
+
+/* La scena si prepara mentre la PSP sta ancora disegnando quella precedente:
+ * i comandi grafici partono solo quando servono (prima volta in un frame), e solo allora
+ * si aspetta la fine del frame precedente e si scambiano gli schermi. */
+static int started, have_prev;
+static uint32_t pclear, pfogcol;
+static float pfn, pff;
+static ScePspFVector3 peye, ptgt;
+static void ensure_started(void)
+{
+    ScePspFVector3 up = { 0, 1, 0 };
+    if (started) return;
+    started = 1;
+    sceGuSync(0, 0);
+    if (have_prev) { sceDisplayWaitVblankStart(); sceGuSwapBuffers(); }
+    have_prev = 1;
+    curtex = -1;
+    list_used = 0;
+    sceGuStart(GU_DIRECT, list);
+    sceGuClearColor(pclear);
+    sceGuClearDepth(0);
+    sceGuClear(GU_COLOR_BUFFER_BIT | GU_DEPTH_BUFFER_BIT);
+    sceGuEnable(GU_DEPTH_TEST);
+    sceGuDepthMask(GU_FALSE);
+    sceGuDisable(GU_BLEND);
+    sceGuEnable(GU_TEXTURE_2D);
+    sceGuEnable(GU_FOG);
+    sceGuFog(pfn, pff, pfogcol);
+    sceGumMatrixMode(GU_PROJECTION);
+    sceGumLoadIdentity();
+    sceGumPerspective(60.0f, (float)SCR_W / SCR_H, 4.0f, 1500.0f);
+    sceGumMatrixMode(GU_VIEW);
+    sceGumLoadIdentity();
+    sceGumLookAt(&peye, &ptgt, &up);
+    sceGumMatrixMode(GU_MODEL);
+    sceGumLoadIdentity();
 }
 
 static void draw_verts(GV *src, int n, int tex)
 {
     GV *dst;
     if (n <= 0) return;
+    ensure_started();
     if (list_used + n * (int)sizeof(GV) > LIST_BYTES - 128 * 1024) return;   /* lista piena: salta, niente crash */
     list_used += n * (int)sizeof(GV);
     bind_tex(tex);
@@ -59,6 +138,7 @@ static void flush_rects(void)
 {
     SV *dst;
     if (nrect <= 0) return;
+    ensure_started();
     if (list_used + nrect * 2 * (int)sizeof(SV) > LIST_BYTES - 32 * 1024) { nrect = 0; return; }
     list_used += nrect * 2 * (int)sizeof(SV);
     dst = (SV *)sceGuGetMemory(nrect * 2 * sizeof(SV));
@@ -100,36 +180,28 @@ void r_init(void)
 void r_textures(const uint32_t *pixels, int count, int size)
 {
     texpix = pixels; texcount = count; texsize = size;
+    build_mips();
     sceKernelDcacheWritebackAll();
+    if (mip_ok) {
+        sceGuSync(0, 0);
+        sceGuStart(GU_DIRECT, list);
+        sceGuTexMode(GU_PSM_8888, NMIP, 0, 0);
+        sceGuTexLevelMode(GU_TEXTURE_AUTO, 0.0f);
+        sceGuTexFilter(GU_LINEAR_MIPMAP_LINEAR, GU_LINEAR);
+        sceGuFinish();
+        sceGuSync(0, 0);
+    }
 }
 
 void r_begin(uint32_t clear, V3 eye, V3 target, float fog_near, float fog_far, uint32_t fogcol)
 {
-    ScePspFVector3 e = { eye.x, eye.y, eye.z }, c = { target.x, target.y, target.z }, up = { 0, 1, 0 };
     int i;
     for (i = 0; i < MAXTEX; i++) nopq[i] = ntrn[i] = nadd[i] = 0;
     nrect = 0;
-    curtex = -1;
-    list_used = 0;
-    sceGuStart(GU_DIRECT, list);
-    sceGuClearColor(clear);
-    sceGuClearDepth(0);
-    sceGuClear(GU_COLOR_BUFFER_BIT | GU_DEPTH_BUFFER_BIT);
-    sceGuEnable(GU_DEPTH_TEST);
-    sceGuDepthMask(GU_FALSE);
-    sceGuDisable(GU_BLEND);
-    sceGuEnable(GU_TEXTURE_2D);
-    sceGuEnable(GU_FOG);
-    sceGuFog(fog_near, fog_far, fogcol);
-
-    sceGumMatrixMode(GU_PROJECTION);
-    sceGumLoadIdentity();
-    sceGumPerspective(60.0f, (float)SCR_W / SCR_H, 4.0f, 1500.0f);
-    sceGumMatrixMode(GU_VIEW);
-    sceGumLoadIdentity();
-    sceGumLookAt(&e, &c, &up);
-    sceGumMatrixMode(GU_MODEL);
-    sceGumLoadIdentity();
+    started = 0;
+    pclear = clear; pfogcol = fogcol; pfn = fog_near; pff = fog_far;
+    peye.x = eye.x; peye.y = eye.y; peye.z = eye.z;
+    ptgt.x = target.x; ptgt.y = target.y; ptgt.z = target.z;
 }
 
 static void put(GV *d, const RV *a, const RV *b, const RV *c)
@@ -157,6 +229,7 @@ void r_tri(const RV *a, const RV *b, const RV *c, int tex, int blend)
 void r_begin2d(void)
 {
     int i;
+    ensure_started();
     for (i = 0; i < MAXTEX; i++) { draw_verts(opq[i], nopq[i], i); nopq[i] = 0; }
     sceGuEnable(GU_BLEND);
     sceGuDepthMask(GU_TRUE);                 /* trasparenti: niente scrittura Z */
@@ -183,9 +256,7 @@ void r_rect(int x, int y, int w, int h, uint32_t col)
 
 void r_end(void)
 {
+    ensure_started();
     flush_rects();
-    sceGuFinish();
-    sceGuSync(0, 0);
-    sceDisplayWaitVblankStart();
-    sceGuSwapBuffers();
+    sceGuFinish();          /* la PSP disegna in parallelo; si aspetta solo all'inizio del frame dopo */
 }

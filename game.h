@@ -18,6 +18,8 @@ typedef struct {
 } Input;
 
 void game_init(void);
+extern int perf_lvl;          /* 0 = qualita' piena, 1-2 = alleggerita */
+void game_set_fps(int fps);
 /* schermata di caricamento (prima di game_init) */
 void game_loading(void);
 void game_update(const Input *in);
@@ -28,6 +30,7 @@ void game_audio_fill(int16_t *stereo, int frames);
 
 #ifdef GAME_DEBUG
 void game_debug_teleport(int where);
+void game_debug_boss(void);
 int  game_debug_state(int what);
 #endif
 

@@ -69,33 +69,73 @@ int main(void)
         if (th >= 0) sceKernelStartThread(th, 0, 0);
     }
 
-    while (running) {
-        SceCtrlData pad;
-        Input in;
-        unsigned h = 0;
+    {
+        /* Logica a passo fisso (60 volte al secondo) separata dal disegno: se un frame e' lento,
+         * il gioco recupera aggiornando piu' volte invece di andare al rallentatore. */
+        const unsigned STEP = 16667;           /* microsecondi */
+        unsigned last = sceKernelGetSystemTimeLow(), acc = STEP, fps_t = last, slow = 0, fast = 0;
+        int frames = 0;
+        unsigned pend = 0;                     /* tasti premuti non ancora consegnati al gioco */
+        while (running) {
+            SceCtrlData pad;
+            Input in;
+            unsigned h = 0, now, dt;
+            int steps = 0;
 
-        sceCtrlReadBufferPositive(&pad, 1);
-        if (pad.Buttons & PSP_CTRL_UP) h |= B_UP;
-        if (pad.Buttons & PSP_CTRL_DOWN) h |= B_DOWN;
-        if (pad.Buttons & PSP_CTRL_LEFT) h |= B_LEFT;
-        if (pad.Buttons & PSP_CTRL_RIGHT) h |= B_RIGHT;
-        if (pad.Buttons & PSP_CTRL_SQUARE) h |= B_SQUARE;
-        if (pad.Buttons & PSP_CTRL_TRIANGLE) h |= B_TRIANGLE;
-        if (pad.Buttons & PSP_CTRL_CROSS) h |= B_CROSS;
-        if (pad.Buttons & PSP_CTRL_CIRCLE) h |= B_CIRCLE;
-        if (pad.Buttons & PSP_CTRL_LTRIGGER) h |= B_L;
-        if (pad.Buttons & PSP_CTRL_RTRIGGER) h |= B_R;
-        if (pad.Buttons & PSP_CTRL_START) h |= B_START;
-        if (pad.Buttons & PSP_CTRL_SELECT) h |= B_SELECT;
+            sceCtrlPeekBufferPositive(&pad, 1);    /* non blocca: legge subito lo stato attuale */
+            if (pad.Buttons & PSP_CTRL_UP) h |= B_UP;
+            if (pad.Buttons & PSP_CTRL_DOWN) h |= B_DOWN;
+            if (pad.Buttons & PSP_CTRL_LEFT) h |= B_LEFT;
+            if (pad.Buttons & PSP_CTRL_RIGHT) h |= B_RIGHT;
+            if (pad.Buttons & PSP_CTRL_SQUARE) h |= B_SQUARE;
+            if (pad.Buttons & PSP_CTRL_TRIANGLE) h |= B_TRIANGLE;
+            if (pad.Buttons & PSP_CTRL_CROSS) h |= B_CROSS;
+            if (pad.Buttons & PSP_CTRL_CIRCLE) h |= B_CIRCLE;
+            if (pad.Buttons & PSP_CTRL_LTRIGGER) h |= B_L;
+            if (pad.Buttons & PSP_CTRL_RTRIGGER) h |= B_R;
+            if (pad.Buttons & PSP_CTRL_START) h |= B_START;
+            if (pad.Buttons & PSP_CTRL_SELECT) h |= B_SELECT;
+            pend |= h & ~prev;                 /* una pressione non va mai persa, anche se breve */
+            prev = h;
 
-        in.ax = (pad.Lx - 128) / 127.0f;
-        in.ay = (pad.Ly - 128) / 127.0f;
-        in.held = h;
-        in.pressed = h & ~prev;
-        prev = h;
+            in.ax = (pad.Lx - 128) / 127.0f;
+            in.ay = (pad.Ly - 128) / 127.0f;
+            /* zona morta circolare con risposta riscalata: niente deriva, risposta piena ai bordi */
+            {
+                float m = in.ax * in.ax + in.ay * in.ay;
+                if (m < 0.2f * 0.2f) { in.ax = in.ay = 0; }
+                else {
+                    float l = __builtin_sqrtf(m), k = (l - 0.2f) / 0.8f / l;
+                    if (k * l > 1) k = 1 / l;
+                    in.ax *= k; in.ay *= k;
+                }
+            }
 
-        game_update(&in);
-        game_render();   /* attende il vblank e scambia i buffer */
+            now = sceKernelGetSystemTimeLow();
+            dt = now - last; last = now;
+            if (dt > 100000) dt = 100000;
+            acc += dt;
+            while (acc >= STEP && steps < 4) {
+                in.held = h | pend;
+                in.pressed = pend;
+                game_update(&in);
+                pend = 0;
+                acc -= STEP;
+                steps++;
+            }
+            if (acc >= STEP) acc = 0;              /* troppo indietro: non inseguire all'infinito */
+            game_render();
+
+            /* misura gli fps e regola da sola la qualita' se la PSP non ce la fa */
+            frames++;
+            if (now - fps_t >= 1000000) {
+                game_set_fps(frames);
+                if (frames < 24) { slow++; fast = 0; } else if (frames >= 50) { fast++; slow = 0; } else { slow = fast = 0; }
+                if (slow >= 2 && perf_lvl < 2) { perf_lvl++; slow = 0; }
+                if (fast >= 6 && perf_lvl > 0) { perf_lvl--; fast = 0; }
+                frames = 0; fps_t = now;
+            }
+        }
     }
 
     sceKernelExitGame();

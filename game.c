@@ -28,7 +28,7 @@
 /* T_LAMP e' attraversabile; da T_GRAVE in su gli oggetti sono solidi */
 enum { T_FLOOR = 0, T_WALL = 1, T_GATE = 2, T_LAMP = 3, T_GRAVE = 4, T_CRATE = 5, T_TREE = 6, T_FIRE = 7,
        T_GRASS = 8, T_DIRT = 9, T_PIER = 10, T_ROCK = 11, T_WATER = 12, T_PINE = 13, T_BOULDER = 14, T_RUIN = 15, T_WELL = 16 };
-enum { M_TITLE, M_PLAY, M_DEAD, M_MENU, M_PAUSE, M_WIN, M_STORY, M_TALK, M_END };
+enum { M_TITLE, M_PLAY, M_DEAD, M_MENU, M_PAUSE, M_WIN, M_STORY, M_TALK, M_END, M_MAP };
 enum { SFX_SWING, SFX_HIT, SFX_HURT, SFX_ROLL, SFX_HEAL, SFX_BRAZIER, SFX_PICK, SFX_EDEATH, SFX_ROAR, SFX_SLAM, SFX_BELL, SFX_MENU, SFX_SELECT, SFX_DIE, SFX_VICTORY };
 enum { PS_FREE, PS_ATK, PS_ROLL, PS_HEAL, PS_HURT, PS_DEAD };
 enum { ES_IDLE, ES_CHASE, ES_WIND, ES_STRIKE, ES_REC, ES_STAG, ES_DEAD };
@@ -381,6 +381,39 @@ static float height_at(int wx, int wy)
             h = t->base + (h - t->base) * k;
         }
     return h;
+}
+
+/* --- mappa del mondo: colori precalcolati per celle di MAPC caselle --- */
+#define MAPN 96
+#define MAPC (WORLDT / MAPN)
+static uint32_t wmapc[MAPN][MAPN];
+static int mapZoom, map_ready;
+static char regionName[28] = "VELMORA";
+static const char *region_name_now(void) { return regionName; }
+static uint32_t map_height_col(float h, float hl, float hu)
+{
+    /* colore per altitudine e rilievo ombreggiato dalla luce in alto a sinistra */
+    float sh = 1 + (hl - h) * 0.03f + (hu - h) * 0.03f, r, g, b;
+    if (h < WL + 0.5f) { r = 40; g = 58; b = 82; sh = 1; }
+    else if (h < 8) { r = 74; g = 88; b = 60; }
+    else if (h < 30) { r = 96; g = 98; b = 70; }
+    else if (h < 60) { r = 112; g = 104; b = 92; }
+    else { r = 150; g = 148; b = 150; }
+    if (sh < 0.6f) sh = 0.6f;
+    if (sh > 1.4f) sh = 1.4f;
+    r *= sh; g *= sh; b *= sh;
+    return RGB((int)(r > 255 ? 255 : r), (int)(g > 255 ? 255 : g), (int)(b > 255 ? 255 : b));
+}
+static void build_world_map(void)
+{
+    static float hh[MAPN][MAPN];
+    int x, y;
+    for (y = 0; y < MAPN; y++)
+        for (x = 0; x < MAPN; x++) hh[y][x] = height_raw(x * MAPC + MAPC / 2, y * MAPC + MAPC / 2);
+    for (y = 0; y < MAPN; y++)
+        for (x = 0; x < MAPN; x++)
+            wmapc[y][x] = map_height_col(hh[y][x], hh[y][x > 0 ? x - 1 : x], hh[y > 0 ? y - 1 : y][x]);
+    map_ready = 1;
 }
 
 /* --- elenchi globali: strade, rovine --- */
@@ -1113,6 +1146,7 @@ void game_init(void)
     WX0 = braz[0].tx - MW / 2; WY0 = braz[0].ty - MH / 2;
     build_map();
     gen_textures();
+    build_world_map();
     P.vig = P.end = P.str = 3;
     P.lvl = 1;
     P.maxFlask = 4;
@@ -1344,7 +1378,7 @@ static void player_update(const Input *in)
     if (in->held & B_UP) my = -1;
     if (in->held & B_DOWN) my = 1;
     ml = sqrtf(mx * mx + my * my);
-    if (ml < 0.25f) { mx = my = 0; ml = 0; }
+    if (ml < 0.1f) { mx = my = 0; ml = 0; }
     else if (ml > 1) { mx /= ml; my /= ml; ml = 1; }
 
     /* X: tocco breve = schivata (al rilascio), tenuto premuto = corsa */
@@ -1538,6 +1572,7 @@ static void player_update(const Input *in)
             P.region = r;
             nm = r >= 1000 ? tw->name : names[r];
             set_msg(nm, 150);
+            strncpy(regionName, nm, sizeof(regionName) - 1);
         }
     }
 
@@ -1552,6 +1587,7 @@ static void player_update(const Input *in)
             sfx(SFX_BRAZIER);
             save_game();
         } else if (b < 0 && near_npc() && P.state == PS_FREE) npc_talk();
+        else if (b < 0) { mode = M_MAP; mapZoom = 0; }       /* lontano da bracieri e persone: mappa */
     }
 }
 
@@ -2361,7 +2397,12 @@ void game_update(const Input *in)
             wi.held &= ~(unsigned)(B_UP | B_DOWN | B_LEFT | B_RIGHT);
             if (hitstop > 0) wi.pressed = wi.pressed & (B_SQUARE | B_TRIANGLE | B_CIRCLE);
             if (hitstop <= 0) player_update(&wi);
-            else if (wi.pressed & (B_SQUARE | B_TRIANGLE)) { P.buf = wi.pressed & (B_SQUARE | B_TRIANGLE); P.bufT = 12; }
+            else {
+                /* durante il congelamento del colpo gli input non si perdono: vengono messi in coda */
+                if (wi.pressed & (B_SQUARE | B_TRIANGLE | B_CIRCLE)) { P.buf = wi.pressed & (B_SQUARE | B_TRIANGLE | B_CIRCLE); P.bufT = 14; }
+                if (wi.held & B_CROSS) P.crossT++;
+                else { if (P.crossT > 0 && P.crossT <= 9) { P.buf = B_CROSS; P.bufT = 14; } P.crossT = 0; }
+            }
         }
         keep_centered();
         if (mode != M_PLAY) break;
@@ -2377,6 +2418,11 @@ void game_update(const Input *in)
         break;
     case M_PAUSE:
         if (in->pressed & (B_START | B_CIRCLE)) mode = M_PLAY;
+        if (in->pressed & B_SQUARE) { mode = M_MAP; mapZoom = 0; }
+        break;
+    case M_MAP:
+        if (in->pressed & (B_SELECT | B_START | B_CIRCLE | B_CROSS)) mode = M_PLAY;
+        if (in->pressed & (B_TRIANGLE | B_SQUARE)) mapZoom ^= 1;
         break;
     case M_MENU:
         if (in->pressed & B_UP) menuSel = (menuSel + 3) % 4;
@@ -2746,6 +2792,21 @@ static float cur_ts = 32;
 static V3 camR, camU;   /* assi della telecamera per i billboard */
 static float cur_gy;    /* quota del suolo per l'oggetto che si sta disegnando */
 static V3 camEye;
+static float camFx = 1, camFz;       /* direzione orizzontale della telecamera */
+int perf_lvl;                        /* 0 = qualita' piena, 1-2 = alleggerita (si regola da sola) */
+static int cur_fps;
+void game_set_fps(int fps) { cur_fps = fps; }
+/* e' visibile? scarta quello che sta dietro la telecamera, fuori dall'inquadratura o oltre la nebbia */
+static int vis(float x, float z, float r)
+{
+    float dx = x - camEye.x, dz = z - camEye.z, along = dx * camFx + dz * camFz, lat = dx * camFz - dz * camFx;
+    float maxd = perf_lvl >= 2 ? 230.0f : 290.0f;
+    if (dx * dx + dz * dz < 45 * 45) return 1;
+    if (along < -r - 12) return 0;
+    if (along > maxd + r) return 0;
+    if (lat < 0) lat = -lat;
+    return lat < along * 1.08f + r + 18;
+}
 #define TEXS(t, s) (cur_tex = (t), cur_ts = (s))
 
 static void add_light(float lx, float lz, float R, float s, float r, float g, float b)
@@ -3825,16 +3886,17 @@ static void draw_outdoor(int tx, int ty, int t, unsigned h)
 
 static void draw_world(float cx, float cz)
 {
-    int tcx = (int)(cx / TS), tcz = (int)(cz / TS), tx, ty;
+    int tcx = (int)(cx / TS), tcz = (int)(cz / TS), tx, ty, gr = perf_lvl >= 2 ? GR - 3 : (perf_lvl ? GR - 1 : GR);
     float bx = -cosf(camYaw), bz = -sinf(camYaw);
     build_corner_grid(tcx, tcz);
-    for (ty = tcz - GR; ty <= tcz + GR; ty++)
-        for (tx = tcx - GR; tx <= tcx + GR; tx++) {
+    for (ty = tcz - gr; ty <= tcz + gr; ty++)
+        for (tx = tcx - gr; tx <= tcx + gr; tx++) {
             int t, dx = tx - tcx, dy = ty - tcz;
             float x0 = (float)tx * TS, z0 = (float)ty * TS;
             unsigned h;
-            if (dx * dx + dy * dy > GR * GR) continue;
+            if (dx * dx + dy * dy > gr * gr) continue;
             if (tx < 0 || ty < 0 || tx >= MW || ty >= MH) continue;
+            if (!vis(x0 + 8, z0 + 8, 26)) continue;
             t = map[ty][tx];
             h = hash2(tx, ty);
             if (!in_town(tx, ty)) { draw_outdoor(tx, ty, t, h); continue; }
@@ -3929,7 +3991,7 @@ static void draw_brazier(int i)
     float x = (braz[i].tx - WX0) * TS + 8.0f, z = (braz[i].ty - WY0) * TS + 8.0f;
     {
         float ex = x - camEye.x, ez = z - camEye.z;
-        if (ex * ex + ez * ez > 260 * 260) return;
+        if (ex * ex + ez * ez > 260 * 260 || !vis(x, z, 20)) return;
     }
     light_at(x, z);
     cur_gy = ground_h(x, z);
@@ -4672,7 +4734,7 @@ static void draw_enemy(Enemy *e)
     float dxp = x - P.x, dzp = z - P.y, br = sinf(frame * 0.12f + x) * 0.5f;
     uint32_t body, dark, eye = RGB(255, 80, 40);
     float gh;
-    if (dxp * dxp + dzp * dzp > 220 * 220) return;
+    if (dxp * dxp + dzp * dzp > 220 * 220 || !vis(x, z, 30)) return;
     light_at(x, z);
     gh = ground_h(x, z);
     cur_gy = gh;
@@ -4874,6 +4936,7 @@ static void draw_boss(void)
     uint32_t body = RGB(130, 120, 112), dark, ember = Bs.phase ? RGB(255, 90, 30) : RGB(255, 165, 60);
     int i;
     if (Bs.state == BS_OFF && Bs.dead) return;
+    if (!vis(x, z, 60)) return;
     light_at(x, z);
     if (Bs.state == BS_DEAD) {
         if (Bs.timer > 0) {
@@ -5181,6 +5244,126 @@ static void vignette(void)
         rectf(0, SH - (k + 1) * 3, SW, 3, rgba(0, a));
         rectf(k * 5, 0, 5, SH, rgba(0, a));
         rectf(SW - (k + 1) * 5, 0, 5, SH, rgba(0, a));
+    }
+}
+
+/* rettangoli di una riga uniti quando il colore e' lo stesso: molti meno elementi da disegnare */
+static void map_row(int x0, int y, int n, int cs, const uint32_t *cols)
+{
+    int i = 0;
+    while (i < n) {
+        int j = i + 1;
+        while (j < n && cols[j] == cols[i]) j++;
+        rectf(x0 + i * cs, y, (j - i) * cs, cs, cols[i]);
+        i = j;
+    }
+}
+static void map_marker(int x, int y, int r, uint32_t c)
+{
+    rectf(x - r - 1, y - r - 1, r * 2 + 3, r * 2 + 3, RGB(12, 10, 12));
+    rectf(x - r, y - r, r * 2 + 1, r * 2 + 1, c);
+}
+static void draw_map(void)
+{
+    const int MX = 24, MY = 44, SZ = 192;
+    int pgx = (int)(P.x / TS) + WX0, pgy = (int)(P.y / TS) + WY0, i, x, y;
+    uint32_t row[MAPN];
+    shade_screen(200);
+    rectf(MX - 3, MY - 3, SZ + 6, SZ + 6, GOLDD);
+    rectf(MX - 2, MY - 2, SZ + 4, SZ + 4, RGB(14, 12, 14));
+    if (!mapZoom) {
+        /* mondo intero: ogni cella copre MAPC caselle */
+        const float k = (float)SZ / WORLDT;
+        text(MX, 28, 2, RGB(235, 215, 180), "MAPPA DEL MONDO");
+        if (map_ready) for (y = 0; y < MAPN; y++) map_row(MX, MY + y * 2, MAPN, 2, wmapc[y]);
+        /* strade */
+        for (i = 0; i < nroad; i++) {
+            int s2, q;
+            for (s2 = 0; s2 + 1 < roads[i].n; s2++)
+                for (q = 0; q <= 8; q++) {
+                    float fx = roads[i].x[s2] + (roads[i].x[s2 + 1] - roads[i].x[s2]) * q / 8.0f;
+                    float fy = roads[i].y[s2] + (roads[i].y[s2 + 1] - roads[i].y[s2]) * q / 8.0f;
+                    rectf(MX + (int)(fx * k), MY + (int)(fy * k), 1, 1, RGB(150, 128, 96));
+                }
+        }
+        /* borghi, Velmora, bracieri, boss */
+        for (y = 0; y < NCELL; y++)
+            for (x = 0; x < NCELL; x++)
+                if (ptown[y][x].ok) map_marker(MX + (int)((ptown[y][x].x0 + ptown[y][x].x1) * 0.5f * k), MY + (int)((ptown[y][x].y0 + ptown[y][x].y1) * 0.5f * k), 1, RGB(200, 180, 140));
+        for (i = 0; i < 3; i++) map_marker(MX + (int)((ctown[i].x0 + ctown[i].x1) * 0.5f * k), MY + (int)((ctown[i].y0 + ctown[i].y1) * 0.5f * k), 1, RGB(220, 200, 150));
+        map_marker(MX + (int)((COREX + CX0 + CITYW / 2) * k), MY + (int)((COREY + CY0 + CITYH / 2) * k), 2, RGB(240, 220, 170));
+        for (i = 0; i < nbraz; i++) if (braz[i].lit) rectf(MX + (int)(braz[i].tx * k) - 1, MY + (int)(braz[i].ty * k) - 1, 3, 3, RGB(255, 150, 50));
+        for (i = 0; i < NRB; i++) if (!(RB[i].state == RS_DEAD)) map_marker(MX + (int)(((int)(RB[i].x / TS) + WX0) * k), MY + (int)(((int)(RB[i].y / TS) + WY0) * k), 1, RGB(210, 40, 40));
+        /* giocatore: punto lampeggiante con direzione */
+        {
+            int px = MX + (int)(pgx * k), py = MY + (int)(pgy * k);
+            map_marker(px, py, 2, (frame & 16) ? RGB(255, 255, 255) : RGB(255, 210, 120));
+            rectf(px + (int)(P.fx * 5) - 1, py + (int)(P.fy * 5) - 1, 2, 2, RGB(255, 255, 255));
+        }
+    } else {
+        /* zona intorno a te: le caselle vere (case, acqua, rocce, alberi), 2 caselle per pixel */
+        const int HALF = MW / 2 - 4;
+        int ox = (int)(P.x / TS) - HALF, oy = (int)(P.y / TS) - HALF, nn = SZ;
+        text(MX, 28, 2, RGB(235, 215, 180), "DINTORNI");
+        for (y = 0; y < nn / 2; y++) {
+            for (x = 0; x < nn / 2 && x < MAPN; x++) {
+                int tx = ox + x * 2 * (HALF * 2) / nn, ty = oy + y * 2 * (HALF * 2) / nn, t;
+                uint32_t c;
+                if (tx < 0 || ty < 0 || tx >= MW || ty >= MH) { row[x] = RGB(10, 10, 12); continue; }
+                t = map[ty][tx];
+                switch (t) {
+                case T_WALL: c = RGB(150, 120, 100); break;
+                case T_WATER: c = RGB(40, 60, 90); break;
+                case T_PIER: c = RGB(130, 100, 70); break;
+                case T_ROCK: c = RGB(120, 118, 122); break;
+                case T_PINE: case T_TREE: c = RGB(44, 66, 44); break;
+                case T_DIRT: c = RGB(110, 96, 74); break;
+                case T_RUIN: c = RGB(100, 96, 92); break;
+                case T_GRASS: case T_BOULDER: case T_GRAVE: c = RGB(72, 88, 58); break;
+                default: c = in_town(tx, ty) ? RGB(92, 88, 96) : RGB(72, 88, 58);
+                }
+                row[x] = c;
+            }
+            map_row(MX, MY + y * 2, nn / 2 < MAPN ? nn / 2 : MAPN, 2, row);
+        }
+        {
+            const float k = (float)nn / (HALF * 2);
+            for (i = 0; i < nbraz; i++) {
+                int bx = braz[i].tx - WX0 - ox, by = braz[i].ty - WY0 - oy;
+                if (bx >= 0 && by >= 0 && bx < HALF * 2 && by < HALF * 2)
+                    map_marker(MX + (int)(bx * k), MY + (int)(by * k), 1, braz[i].lit ? RGB(255, 150, 50) : RGB(140, 130, 120));
+            }
+            for (i = 0; i < NE; i++) {
+                int ex = (int)(E[i].x / TS) - ox, ey = (int)(E[i].y / TS) - oy;
+                if (E[i].alive && E[i].state != ES_DEAD && ex >= 0 && ey >= 0 && ex < HALF * 2 && ey < HALF * 2)
+                    rectf(MX + (int)(ex * k), MY + (int)(ey * k), 1, 1, RGB(200, 60, 50));
+            }
+            for (i = 0; i < NRB; i++) {
+                int bx = (int)(RB[i].x / TS) - ox, by = (int)(RB[i].y / TS) - oy;
+                if (RB[i].state != RS_DEAD && bx >= 0 && by >= 0 && bx < HALF * 2 && by < HALF * 2) map_marker(MX + (int)(bx * k), MY + (int)(by * k), 2, RGB(220, 40, 40));
+            }
+            {
+                int px = MX + (int)(HALF * k), py = MY + (int)(HALF * k);
+                map_marker(px, py, 2, (frame & 16) ? RGB(255, 255, 255) : RGB(255, 210, 120));
+                rectf(px + (int)(P.fx * 6) - 1, py + (int)(P.fy * 6) - 1, 2, 2, RGB(255, 255, 255));
+            }
+        }
+    }
+    /* legenda */
+    {
+        int lx = MX + SZ + 18, ly = MY + 4;
+        map_marker(lx, ly + 3, 2, RGB(255, 210, 120)); text(lx + 8, ly, 1, RGB(220, 210, 190), "TU");
+        rectf(lx - 1, ly + 15, 3, 3, RGB(255, 150, 50)); text(lx + 8, ly + 13, 1, RGB(220, 210, 190), "BRACIERE ACCESO");
+        map_marker(lx, ly + 29, 1, RGB(210, 40, 40)); text(lx + 8, ly + 26, 1, RGB(220, 210, 190), "BOSS");
+        map_marker(lx, ly + 42, 1, RGB(200, 180, 140)); text(lx + 8, ly + 39, 1, RGB(220, 210, 190), "BORGO");
+        rectf(lx - 1, ly + 55, 3, 1, RGB(150, 128, 96)); text(lx + 8, ly + 52, 1, RGB(220, 210, 190), "STRADA");
+        if (P.region >= 0) {
+            const char *rn = region_name_now();
+            text(lx - 2, ly + 78, 1, RGB(170, 160, 140), "TI TROVI A");
+            text(lx - 2, ly + 90, 1, RGB(235, 215, 180), rn);
+        }
+        text(lx - 2, MY + SZ - 22, 1, RGB(160, 150, 135), mapZoom ? "TRIANGOLO  MONDO" : "TRIANGOLO  DINTORNI");
+        text(lx - 2, MY + SZ - 10, 1, RGB(160, 150, 135), "SELECT  CHIUDI");
     }
 }
 
@@ -5543,7 +5726,7 @@ static void rb_draw(void)
         RBoss *b = &RB[i];
         float gh, ex = b->x - camEye.x, ez = b->y - camEye.z;
         if (b->state == RS_DEAD && b->timer <= 0) continue;
-        if (ex * ex + ez * ez > 300 * 300) continue;
+        if (ex * ex + ez * ez > 300 * 300 || !vis(b->x, b->y, 50)) continue;
         light_at(b->x, b->y);
         gh = ground_h(b->x, b->y);
         if (i == RB_ANNEGATA) gh = WL + 0.9f;
@@ -5666,6 +5849,7 @@ void game_render(void)
         if (camU.y < 0) camU = v3(-camU.x, -camU.y, -camU.z);
     }
     camEye = eye;
+    camFx = fx; camFz = fz;
     {
         /* nebbia: col temporale vira al grigio-verde; il lampo la schiarisce per un attimo */
         uint32_t fc = FOGC;
@@ -5721,7 +5905,7 @@ void game_render(void)
         ground_spot(drop.x, drop.y, 16, 0.6f, rgba(RGB(80, 170, 240), 90), RB_ADD);
         cur_gy = 0;
     }
-    rim_on = 1;
+    rim_on = perf_lvl < 2;
     for (i = 0; i < NE; i++) if (E[i].alive) draw_enemy(&E[i]);
     lo_detail = 0; caps_near = 0;
     caps_near = 1;
@@ -5748,7 +5932,7 @@ void game_render(void)
     {
         int intown = in_town((int)(P.x / TS), (int)(P.y / TS));
         cur_gy = 0;
-        for (i = 0; i < 36; i++) {
+        for (i = 0; i < (perf_lvl ? 16 : 36); i++) {
             float sx = (float)(hash2(i, 21) % 160) - 80, sz = (float)(hash2(i, 23) % 160) - 80;
             float sp = 0.08f + (hash2(i, 25) % 10) * 0.012f, life = (float)(((unsigned)frame + hash2(i, 27)) % 400);
             float px = P.x + sx + sinf(frame * 0.02f + i) * 6, pz = P.y + sz + cosf(frame * 0.017f + i * 1.3f) * 6;
@@ -5777,7 +5961,7 @@ void game_render(void)
         }
     /* pioggia: gocce allungate attorno alla telecamera e schizzi a terra */
     if (rainAmt > 0.02f) {
-        int nd = (int)(90 * rainAmt);
+        int nd = (int)((perf_lvl ? 40 : 90) * rainAmt);
         float cx = tgt.x, cz = tgt.z, gyc = ground_h(P.x, P.y);
         cur_gy = 0;
         for (i = 0; i < nd; i++) {
@@ -5844,6 +6028,8 @@ void game_render(void)
         text(44, SH - 80, 1, RGB(255, 200, 130), "ILDE, LA GUARDIANA");
         text(44, SH - 64, 2, RGB(235, 225, 205), talk_a);
         text(44, SH - 50, 2, RGB(235, 225, 205), talk_b);
+    } else if (mode == M_MAP) {
+        draw_map();
     } else if (mode == M_PAUSE) {
         shade_screen(180);
         text_c(26, 4, RGB(235, 215, 180), "PAUSA");
@@ -5855,8 +6041,14 @@ void game_render(void)
         text(110, 134, 2, RGB(200, 190, 170), "X");             text(250, 134, 2, RGB(235, 225, 205), "SCHIVATA");
         text(110, 150, 2, RGB(200, 190, 170), "CERCHIO");       text(250, 150, 2, RGB(235, 225, 205), "FIALA DI BRACE");
         text(110, 166, 2, RGB(200, 190, 170), "R");             text(250, 166, 2, RGB(235, 225, 205), "AGGANCIO");
-        text(110, 182, 2, RGB(200, 190, 170), "SELECT");        text(250, 182, 2, RGB(235, 225, 205), "BRACIERE");
-        text_c(226, 2, RGB(160, 150, 135), "START  RIPRENDI");
+        text(110, 182, 2, RGB(200, 190, 170), "SELECT");        text(250, 182, 2, RGB(235, 225, 205), "BRACIERE / MAPPA");
+        text_c(226, 2, RGB(160, 150, 135), "START  RIPRENDI   QUADRATO  MAPPA");
+        {   /* fotogrammi al secondo e livello di qualita' automatico */
+            char fb[40], nb[12];
+            strcpy(fb, "FPS "); itoa_s(cur_fps, nb); strcat(fb, nb);
+            strcat(fb, perf_lvl == 0 ? "  QUALITA ALTA" : (perf_lvl == 1 ? "  QUALITA MEDIA" : "  QUALITA BASSA"));
+            text(8, 258, 1, RGB(170, 160, 140), fb);
+        }
     } else if (mode == M_MENU) {
         static const char *opts[4] = { "VIGORE", "RESISTENZA", "FORZA", "ESCI" };
         char b[48], n[12];
