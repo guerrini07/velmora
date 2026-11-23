@@ -102,6 +102,8 @@ static const int spawns[][3] = {
 typedef struct {
     float x, y, fx, fy;
     int kind, hp, state, timer, alive, flash, hitBy, hitDone, deadT, id;
+    float kvx, kvy, az, avz, tilt;   /* spinta del colpo, altezza in volo, inclinazione del corpo */
+    int air;
 } Enemy;
 static Enemy E[MAXE];
 static int NE;
@@ -188,6 +190,15 @@ static void rb_player_hits(float range, int dmg);
 static void rb_update(void);
 static void rb_reset_all(void);
 static void rb_shift(float ox, float oy);
+typedef struct { float x, y, h, s; int t; } Puff;
+static Puff puf[10];      /* nuvole di sangue */
+static void spawn_puff(float x, float y, float h, float sz)
+{
+    int i, b = 0;
+    for (i = 0; i < 10; i++) if (puf[i].t < puf[b].t) b = i;
+    puf[b].x = x; puf[b].y = y; puf[b].h = h; puf[b].s = sz; puf[b].t = 18;
+}
+
 static float shockX, shockY; static int shockT;   /* onda d'urto del colpo pesante */
 enum { TRMAX = 18 };
 static int trN;   /* scia della lama */
@@ -1037,6 +1048,7 @@ static void move_window(int nx0, int ny0)
     for (i = 0; i < MAXBLOOD; i++) { blood[i].x -= ox; blood[i].y -= oy; }
     for (i = 0; i < 6; i++) { hfx[i].x -= ox; hfx[i].y -= oy; }
     shockX -= ox; shockY -= oy;
+    for (i = 0; i < 10; i++) { puf[i].x -= ox; puf[i].y -= oy; }
     rb_shift(ox, oy);
     trN = 0;
     for (i = 0; i < NE; i++) {
@@ -1157,6 +1169,8 @@ static const float ARANGE[5] = { 33, 40, 33, 34, 36 };
 static const float ADMG[5] = { 1.0f, 1.0f, 1.05f, 1.45f, 1.3f };
 static const int ACOST[5] = { 15, 30, 14, 20, 22 };
 static int hitstop;      /* congelamento di qualche frame quando un colpo va a segno */
+static int comboN, comboT, comboBest;   /* contatore dei colpi consecutivi */
+static float rainAmt, cmbAmt; static int flashT;   /* pioggia, telecamera da combattimento, lampo */
 
 static void player_hits(void)
 {
@@ -1179,9 +1193,23 @@ static void player_hits(void)
             sfx(SFX_HIT);
             hitstop = P.atk == AT_HEAVY ? 6 : 3;
             add_blood(e->x + dx / d * 6, e->y + dy / d * 6, 2.5f + frnd() * 3);
-            move_circle(&e->x, &e->y, EK[e->kind].r, dx / d * 4, dy / d * 4);
+            spawn_puff(e->x - dx / d * 2, e->y - dy / d * 2, (EK[e->kind].r > 9 ? 14.0f : 9.0f) + e->az, P.atk == AT_HEAVY ? 7.0f : 5.0f);
+            comboN++; comboT = 110;
+            if (comboN > comboBest) comboBest = comboN;
+            {
+                /* reazione al colpo: spinta, e i nemici leggeri vengono lanciati in aria dal colpo pesante */
+                float kb = P.atk == AT_HEAVY ? 2.6f : (P.atk == AT_L3 ? 3.2f : (P.atk == AT_RUN ? 2.4f : 1.5f));
+                int light = e->kind < 2;
+                if (EK[e->kind].poise && P.atk != AT_HEAVY) kb *= 0.4f;
+                e->kvx = dx / d * kb; e->kvy = dy / d * kb;
+                if (e->air) { e->avz = 1.6f; e->kvx *= 0.4f; e->kvy *= 0.4f; }          /* giocoleria in aria */
+                else if (light && (P.atk == AT_HEAVY || (P.atk == AT_L3 && e->kind == 0))) { e->air = 1; e->avz = P.atk == AT_HEAVY ? 3.8f : 2.4f; }
+                e->tilt = e->air ? -0.5f : -0.25f;
+            }
             if (e->hp <= 0) {
-                e->state = ES_DEAD; e->deadT = 40;
+                e->state = ES_DEAD; e->deadT = 60;
+                e->kvx = dx / d * 3.2f; e->kvy = dy / d * 3.2f;
+                if (e->kind < 2) { e->air = 1; e->avz = 2.6f + (P.atk == AT_HEAVY ? 1.5f : 0); }
                 mark_killed(e->id);
                 sfx(SFX_EDEATH);
                 P.frags += EK[e->kind].reward;
@@ -1415,11 +1443,11 @@ static void player_update(const Input *in)
          * Senza direzione: saltello all'indietro, piu' breve */
         int dur = P.backstep ? 13 : 22;
         float t = (float)P.timer / dur, s;
-        s = P.backstep ? 3.4f * (1 - t) : (t < 0.7f ? 4.0f * (1 - t * 0.8f) : 1.2f * (1 - t) * 3);
+        s = P.backstep ? 3.4f * (1 - t) : (t < 0.1f ? 4.6f : (t < 0.68f ? 4.2f * (1 - (t - 0.1f) * 0.9f) : 2.3f * (1 - t) / 0.32f));
         P.timer++;
         if (P.timer == 2) P.iframes = P.backstep ? 7 : 13;
         move_circle(&P.x, &P.y, 6, P.rx * s, P.ry * s);
-        if (P.timer == 3 || P.timer == 12) spawn_parts(P.x, P.y, 3, RGB(120, 112, 104), 0.6f);
+        if (!P.backstep && (P.timer == 3 || P.timer == 9 || P.timer == 15)) spawn_parts(P.x, P.y, P.timer == 15 ? 6 : 3, RGB(120, 112, 104), 0.8f);
         P.vx = P.rx * 0.8f; P.vy = P.ry * 0.8f;
         if (P.timer >= dur - 4 && P.buf && !(P.buf & B_CROSS)) {
             unsigned bb = P.buf;
@@ -1541,6 +1569,22 @@ static void enemies_update(void)
         const EKind *k = &EK[e->kind];
         float dx, dy, d;
         if (!e->alive) continue;
+        /* fisica dei colpi: spinta con attrito, volo con gravita' e rimbalzo, il corpo torna dritto */
+        if (e->kvx != 0 || e->kvy != 0) {
+            move_circle(&e->x, &e->y, k->r, e->kvx, e->kvy);
+            e->kvx *= e->air ? 0.94f : 0.78f; e->kvy *= e->air ? 0.94f : 0.78f;
+            if (fabsf(e->kvx) + fabsf(e->kvy) < 0.05f) e->kvx = e->kvy = 0;
+        }
+        if (e->air) {
+            e->az += e->avz; e->avz -= 0.24f;
+            e->tilt += (e->state == ES_DEAD ? -0.12f : -0.04f);
+            if (e->tilt < -1.45f) e->tilt = -1.45f;
+            if (e->az <= 0) {
+                e->az = 0;
+                if (e->avz < -2.0f) { e->avz = -e->avz * 0.3f; spawn_parts(e->x, e->y, 5, RGB(130, 120, 110), 1.2f); shake = shake > 3 ? shake : 3; }
+                else { e->air = 0; e->avz = 0; if (e->state != ES_DEAD) { e->state = ES_STAG; e->timer = 16; } }
+            } else if (e->state != ES_DEAD) { e->state = ES_STAG; if (e->timer < 4) e->timer = 4; }
+        } else if (e->state != ES_DEAD) e->tilt *= 0.8f;
         if (e->state == ES_DEAD) { if (--e->deadT <= 0) e->alive = 0; continue; }
         if (e->flash > 0) e->flash--;
         dx = P.x - e->x; dy = P.y - e->y; d = sqrtf(dx * dx + dy * dy) + 0.001f;
@@ -2226,6 +2270,24 @@ void game_update(const Input *in)
     for (i = 0; i < MAXBLOOD; i++) if (blood[i].life > 0) blood[i].life--;
     for (i = 0; i < 6; i++) if (hfx[i].t > 0) hfx[i].t--;
     if (shockT > 0) shockT--;
+    for (i = 0; i < 10; i++) if (puf[i].t > 0) puf[i].t--;
+    if (comboT > 0 && --comboT == 0) comboN = 0;
+    {
+        /* meteo: temporali che vanno e vengono, con lampi */
+        float tr = sinf(frame * 0.0009f) > 0 ? 1.0f : 0.0f;
+        int k2, near = 0;
+        rainAmt += (tr - rainAmt) * 0.004f;
+        if (flashT > 0) flashT--;
+        else if (rainAmt > 0.6f && rnd() % 420 == 0) { flashT = 10; shake = shake > 2 ? shake : 2; }
+        /* telecamera piu' alta e larga quando si combatte */
+        for (k2 = 0; k2 < NE && !near; k2++)
+            if (E[k2].alive && E[k2].state != ES_DEAD && E[k2].state != ES_IDLE) {
+                float ex = E[k2].x - P.x, ey = E[k2].y - P.y;
+                if (ex * ex + ey * ey < 110 * 110) near = 1;
+            }
+        if (P.lock != -1 || (Bs.state != BS_OFF && !Bs.dead)) near = 1;
+        cmbAmt += ((near ? 1.0f : 0.0f) - cmbAmt) * 0.03f;
+    }
     camX += (P.x - camX) * 0.18f;
     camZ += (P.y - camZ) * 0.18f;
     music_mode = (mode == M_TITLE || mode == M_STORY) ? 0 : (mode == M_END ? 3 :
@@ -2348,7 +2410,7 @@ void game_update(const Input *in)
 #define FOGC RGB(26, 30, 42)
 
 enum { TX_WHITE, TX_COBBLE, TX_STONE, TX_WOOD, TX_SLATE, TX_CLOTH, TX_METAL, TX_BARK, TX_GLOW, TX_WINDOW, TX_BRICK, TX_PLASTER, TX_FLAG, TX_GRASS, TX_DIRT, TX_ROCK, TX_FIRE, NTEX };
-#define TSZ 64
+#define TSZ 128
 
 static V3 v3(float x, float y, float z) { V3 v; v.x = x; v.y = y; v.z = z; return v; }
 static uint32_t rgba(uint32_t c, int a) { return (c & 0x00FFFFFFu) | ((uint32_t)a << 24); }
@@ -2406,194 +2468,270 @@ static uint32_t pack(float r, float g, float b, float a)
     return ((uint32_t)A << 24) | ((uint32_t)B << 16) | ((uint32_t)G << 8) | (uint32_t)R;
 }
 
+/* ---- materiali procedurali "realistici": per ogni texture si calcolano un rilievo (altezza) e un colore,
+ * poi il rilievo viene illuminato (luce radente dall'alto a sinistra) e le cavita' si scuriscono.
+ * Le coordinate u,v vanno da 0 a 1 e tutto si ripete senza cuciture. ---- */
+static float tH[TSZ * TSZ], tR[TSZ * TSZ], tG[TSZ * TSZ], tB[TSZ * TSZ];
+static float nzp(float u, float v, int P, int s) { return vnoise2(u * P, v * P, P, P, s); }
+static float fbp(float u, float v, int P, int s, int oct)
+{
+    float a = 0, am = 0.5f, n = 0;
+    int o;
+    for (o = 0; o < oct; o++) { a += am * nzp(u, v, P, s + o * 7); n += am; P *= 2; am *= 0.5f; }
+    return a / n;
+}
+/* celle di Voronoi ripetibili: C celle per lato; f1/f2 in unita' di cella */
+static void vorp(float u, float v, int C, int s, float jit, float *f1, float *f2, int *id)
+{
+    float x = u * C, y = v * C;
+    int cx = (int)floorf(x), cy = (int)floorf(y), i, j;
+    *f1 = *f2 = 9; *id = 0;
+    for (j = cy - 1; j <= cy + 1; j++)
+        for (i = cx - 1; i <= cx + 1; i++) {
+            int wi = ((i % C) + C) % C, wj = ((j % C) + C) % C;
+            float px = i + 0.5f + (hashf(wi, wj, s) - 0.5f) * jit, py = j + 0.5f + (hashf(wi, wj, s + 1) - 0.5f) * jit;
+            float d = sqrtf((x - px) * (x - px) + (y - py) * (y - py));
+            if (d < *f1) { *f2 = *f1; *f1 = d; *id = wj * C + wi; }
+            else if (d < *f2) *f2 = d;
+        }
+}
+static float sstep(float a, float b, float x) { float t = (x - a) / (b - a); if (t < 0) t = 0; if (t > 1) t = 1; return t * t * (3 - 2 * t); }
+/* blocchi in file sfalsate (mattoni, conci, lastre): restituisce distanza dal bordo (0..0.5) e indice del blocco */
+static float blocks(float u, float v, int cols, int rows, float off, int *bid, float *bx, float *by)
+{
+    float y = v * rows, x, fx, fy;
+    int r = (int)floorf(y), c;
+    x = u * cols + (r & 1) * off;
+    c = (int)floorf(x);
+    fx = x - c; fy = y - r;
+    *bid = (((c % cols) + cols) % cols) + ((r % rows) + rows) % rows * 64;
+    *bx = fx; *by = fy;
+    {
+        float ex = fx < 0.5f ? fx : 1 - fx, ey = fy < 0.5f ? fy : 1 - fy;
+        ex *= (float)rows / cols;            /* in unita' di altezza del blocco */
+        return ex < ey ? ex : ey;
+    }
+}
+
+static void material(int t, float u, float v, int x, int y, float *h, float *r, float *g, float *b, float *a)
+{
+    float f1, f2, n, m, e, bx, by;
+    int id;
+    *a = 1;
+    switch (t) {
+    case TX_COBBLE:   /* ciottoli bombati, fughe terrose e qualche pietra piu' scura */
+        vorp(u, v, 5, 1, 0.75f, &f1, &f2, &id);
+        e = f2 - f1;
+        n = fbp(u, v, 16, 5, 4);
+        *h = sstep(0.0f, 0.45f, e) * (0.8f + 0.2f * hashf(id, 0, 3)) + 0.12f * (n - 0.5f);
+        m = 0.42f + 0.22f * hashf(id, 0, 4) + 0.18f * (n - 0.5f);
+        *r = m * (0.95f + 0.1f * hashf(id, 1, 6)); *g = m * 0.96f; *b = m * (1.0f + 0.08f * hashf(id, 2, 7));
+        if (e < 0.1f) { float d = 0.18f + 0.1f * fbp(u, v, 32, 9, 2); *r = d * 1.1f; *g = d * 0.95f; *b = d * 0.8f; }
+        if (hashf(x, y, 9) > 0.992f && e > 0.15f) { *r += 0.2f; *g += 0.2f; *b += 0.22f; }   /* riflessi bagnati */
+        break;
+    case TX_STONE: {  /* conci squadrati con spigoli smussati, scheggiature, crepe e muschio */
+        int bid; float d = blocks(u, v, 2, 4, 0.5f, &bid, &bx, &by);
+        n = fbp(u, v, 8, 13, 4); m = fbp(u, v, 4, 11, 3);
+        e = d + (fbp(u, v, 32, 15, 2) - 0.5f) * 0.05f;
+        *h = sstep(0.02f, 0.09f, e) * (0.85f + 0.15f * n);
+        if (fabsf(nzp(u, v, 6, 17) - 0.5f) < 0.012f) *h *= 0.4f;
+        {
+            float c = 0.48f + 0.16f * hashf(bid, 0, 4) + 0.25f * (n - 0.5f);
+            *r = c; *g = c * 0.97f; *b = c * 0.93f;
+        }
+        if (e < 0.03f) { *r = *g = *b = 0.2f; }
+        if (m > 0.58f && *h < 0.9f) { float k = sstep(0.58f, 0.7f, m); *r *= 1 - 0.3f * k; *g *= 1 + 0.05f * k; *b *= 1 - 0.4f * k; }
+        break;
+    }
+    case TX_BRICK: {  /* mattoni con fughe incassate, spigoli rotti, fuliggine e salnitro */
+        int bid; float d = blocks(u, v, 4, 8, 0.5f, &bid, &bx, &by);
+        n = fbp(u, v, 16, 63, 4);
+        e = d + (fbp(u, v, 32, 65, 2) - 0.5f) * 0.06f;
+        *h = sstep(0.04f, 0.14f, e) * (0.85f + 0.15f * n);
+        {
+            float c = 0.5f + 0.2f * hashf(bid, 0, 62) + 0.2f * (n - 0.5f);
+            *r = c * 1.08f; *g = c * 0.62f; *b = c * 0.5f;
+            if (hashf(bid, 1, 64) > 0.85f) { *r *= 0.6f; *g *= 0.6f; *b *= 0.62f; }
+        }
+        if (e < 0.05f) { float c = 0.42f + 0.1f * n; *r = c; *g = c * 0.97f; *b = c * 0.9f; }
+        if (fbp(u, v, 4, 67, 3) > 0.66f) { *r += 0.12f; *g += 0.13f; *b += 0.13f; }
+        if (v > 0.6f) { float k = (v - 0.6f) * 0.5f * fbp(u, v, 2, 69, 2); *r -= k; *g -= k; *b -= k; }
+        break;
+    }
+    case TX_FLAG: {   /* lastre di pietra consumate con giunti e crepe */
+        int bid; float d = blocks(u, v, 2, 3, 0.4f, &bid, &bx, &by);
+        n = fbp(u, v, 8, 83, 4);
+        e = d + (fbp(u, v, 32, 87, 2) - 0.5f) * 0.03f;
+        *h = sstep(0.01f, 0.05f, e) * (0.9f + 0.1f * n);
+        if (fabsf(nzp(u, v, 5, 85) - 0.5f) < 0.01f) *h *= 0.5f;
+        { float c = 0.5f + 0.15f * hashf(bid, 0, 81) + 0.22f * (n - 0.5f); *r = c * 0.97f; *g = c * 0.97f; *b = c; }
+        if (e < 0.015f) *r = *g = *b = 0.16f;
+        break;
+    }
+    case TX_SLATE: {  /* tegole d'ardesia: ogni fila copre la precedente */
+        int bid; float d = blocks(u, v, 8, 8, 0.5f, &bid, &bx, &by);
+        n = fbp(u, v, 16, 17, 3);
+        *h = by * 0.8f + 0.2f * sstep(0.0f, 0.06f, d);
+        { float c = 0.36f + 0.16f * hashf(bid, 0, 8) + 0.15f * (n - 0.5f); *r = c * 0.88f; *g = c * 0.94f; *b = c * 1.08f; }
+        if (by > 0.92f) { *r *= 0.4f; *g *= 0.4f; *b *= 0.4f; }
+        break;
+    }
+    case TX_WOOD: {   /* assi con venature, nodi e fessure */
+        float pl = u * 4, fx = pl - floorf(pl);
+        int pi = (int)floorf(pl);
+        float kx = (hashf(pi, 0, 7) * 0.6f + 0.2f), ky = hashf(pi, 1, 8);
+        float dk = sqrtf((fx - kx) * (fx - kx) * 16 + (v - ky) * (v - ky) * 4);
+        float gr = sinf(v * 60 + fbp(u, v, 4, 15, 3) * 10 + pi * 3 + 3.0f / (dk + 0.3f));
+        n = fbp(u, v, 32, 19, 2);
+        *h = (fx < 0.04f || fx > 0.96f) ? 0.1f : 0.75f + 0.12f * gr + 0.1f * n;
+        { float c = 0.36f + 0.1f * gr + 0.12f * hashf(pi, 2, 5) + 0.08f * (n - 0.5f); *r = c; *g = c * 0.8f; *b = c * 0.62f; }
+        if (dk < 0.12f) { *r *= 0.55f; *g *= 0.55f; *b *= 0.55f; }
+        if (fx < 0.04f || fx > 0.96f) *r = *g = *b = 0.08f;
+        break;
+    }
+    case TX_PLASTER: {  /* intonaco macchiato, colature e chiazze scrostate con mattoni sotto */
+        n = fbp(u, v, 4, 71, 4); m = fbp(u, v, 8, 73, 4);
+        *h = 0.75f + 0.12f * (m - 0.5f);
+        { float c = 0.66f + 0.14f * (m - 0.5f) - 0.15f * v * fbp(u * 4, v, 2, 75, 2); *r = c; *g = c * 0.96f; *b = c * 0.88f; }
+        if (n > 0.64f) {
+            int bid; float d = blocks(u, v, 5, 10, 0.5f, &bid, &bx, &by);
+            float c = 0.42f + 0.14f * hashf(bid, 0, 77);
+            *h = 0.35f * sstep(0.03f, 0.1f, d);
+            *r = c * 1.05f; *g = c * 0.66f; *b = c * 0.55f;
+            if (d < 0.04f) { *r = *g = *b = 0.32f; }
+        } else if (n > 0.61f) { *h = 0.55f; *r *= 0.75f; *g *= 0.75f; *b *= 0.75f; }
+        break;
+    }
+    case TX_METAL: {  /* piastre spazzolate, giunti, rivetti e graffi */
+        float pu = u * 2, pv = v * 2, fx = pu - floorf(pu), fy = pv - floorf(pv);
+        float rx = fx - 0.12f, ry = fy - 0.12f, rd = sqrtf(rx * rx + ry * ry);
+        n = nzp(u * 1, v * 16, 64, 31);
+        *h = 0.7f + 0.05f * n;
+        if (fx < 0.02f || fy < 0.02f) *h = 0.2f;
+        if (rd < 0.05f) *h = 0.7f + 0.3f * sqrtf(1 - rd / 0.05f);
+        { float c = 0.6f + 0.14f * (n - 0.5f) + 0.1f * (fbp(u, v, 4, 33, 3) - 0.5f); *r = c * 0.95f; *g = c * 0.97f; *b = c; }
+        if (fabsf(nzp(u, v, 8, 35) - 0.5f) < 0.006f) { *r += 0.25f; *g += 0.25f; *b += 0.25f; }
+        break;
+    }
+    case TX_BARK:     /* corteccia a solchi profondi verticali */
+        n = fbp(u, v * 0.25f, 16, 41, 4);
+        m = 1 - fabsf(nzp(u, v * 0.25f, 12, 45) * 2 - 1);
+        *h = 0.3f + 0.5f * m * m + 0.2f * n;
+        { float c = 0.32f + 0.2f * (*h) + 0.08f * (n - 0.5f); *r = c; *g = c * 0.9f; *b = c * 0.8f; }
+        break;
+    case TX_CLOTH: {  /* trama intrecciata con fibre */
+        float wu = u * 48, wv = v * 48, cu = wu - floorf(wu), cv = wv - floorf(wv);
+        int ch = ((int)floorf(wu) + (int)floorf(wv)) & 1;
+        float th = ch ? sinf(cu * PI) : sinf(cv * PI);
+        n = fbp(u, v, 8, 21, 3);
+        *h = 0.4f + 0.4f * th + 0.2f * n;
+        { float c = 0.6f + 0.12f * th + 0.2f * (n - 0.5f); *r = *g = *b = c; }
+        break;
+    }
+    case TX_ROCK:     /* roccia stratificata con fratture e licheni */
+        n = fbp(u, v, 8, 111, 5);
+        m = sinf(v * 28 + fbp(u, v, 4, 113, 3) * 8);
+        *h = 0.5f + 0.3f * (n - 0.5f) * 2 + 0.15f * m;
+        if (fabsf(nzp(u, v, 6, 115) - 0.5f) < 0.015f) *h *= 0.35f;
+        { float c = 0.46f + 0.2f * (n - 0.5f) + 0.06f * m; *r = c * 0.96f; *g = c * 0.96f; *b = c; }
+        if (fbp(u, v, 4, 117, 3) > 0.64f) { *r *= 0.82f; *g *= 0.98f; *b *= 0.7f; }
+        break;
+    case TX_DIRT:     /* terra battuta con sassolini */
+        vorp(u, v, 14, 121, 0.9f, &f1, &f2, &id);
+        n = fbp(u, v, 8, 101, 5);
+        e = hashf(id, 0, 123) > 0.55f ? sstep(0.35f, 0.0f, f1) : 0;
+        *h = 0.35f + 0.25f * n + 0.4f * e;
+        { float c = 0.4f + 0.2f * (n - 0.5f); *r = c; *g = c * 0.84f; *b = c * 0.68f; }
+        if (e > 0) { float c = 0.45f + 0.2f * hashf(id, 1, 125); *r += (c - *r) * e; *g += (c * 0.95f - *g) * e; *b += (c * 0.9f - *b) * e; }
+        break;
+    case TX_GRASS: {  /* fili d'erba: strisce verticali fitte, chiazze secche e trifoglio */
+        float bl2 = nzp(u * 1.0f, v * 0.25f, 64, 93);
+        n = fbp(u, v, 8, 91, 4);
+        *h = 0.3f + 0.5f * bl2 + 0.2f * n;
+        { float c = 0.38f + 0.28f * bl2 + 0.12f * (n - 0.5f); *r = c * 0.72f; *g = c; *b = c * 0.55f; }
+        if (fbp(u, v, 4, 97, 3) > 0.64f) { *r = (*g) * 0.95f; *b = (*g) * 0.55f; *g *= 0.86f; }
+        break;
+    }
+    case TX_GLOW: {
+        float dx = (u - 0.5f) * 2, dy = (v - 0.5f) * 2, d = sqrtf(dx * dx + dy * dy), k = 1 - d;
+        if (k < 0) k = 0;
+        *h = 0; *r = *g = *b = 1; *a = k * k;
+        break;
+    }
+    case TX_WINDOW: {   /* vetrata ad arco acuto con piombature (disegnata a 64 e ingrandita) */
+        float X = u * 64, Y = v * 64, dx = X - 32, fy = v, dist;
+        int inside;
+        *h = 0.5f;
+        if (Y >= 22) { inside = dx >= -26 && dx <= 26; dist = 26 - fabsf(dx); }
+        else {
+            float dl = sqrtf((X - 58) * (X - 58) + (Y - 22) * (Y - 22)), dr = sqrtf((X - 6) * (X - 6) + (Y - 22) * (Y - 22));
+            dist = 52 - (dx < 0 ? dl : dr); inside = dist > 0 && Y > 0;
+        }
+        if (Y > 61) inside = 0;
+        if (!inside || dist < 3) { *r = *g = *b = 0.1f; break; }
+        { float c = 0.8f + 0.2f * fbp(u, v, 4, 51, 3); *r = c; *g = c * (0.7f + 0.2f * fy); *b = c * (0.35f + 0.25f * fy); }
+        if (fabsf(dx) < 1.5f || fabsf(Y - 38) < 1.5f) { *r = *g = *b = 0.08f; }
+        else if (fmodf(X, 8) < 0.8f || fmodf(Y, 9) < 0.8f) { *r *= 0.55f; *g *= 0.55f; *b *= 0.55f; }
+        break;
+    }
+    case TX_FIRE: {
+        float in, edge, core;
+        n = 0.6f * nzp(u, v * 3, 3, 71) + 0.4f * nzp(u, v * 2.57f, 7, 73);
+        edge = v + (n - 0.5f) * 0.55f;
+        in = (v < 0.3f ? v / 0.3f : 1) * (edge > 0.7f ? (edge > 1.0f ? 0 : (1.0f - edge) / 0.3f) : 1);
+        in *= 0.55f + 0.6f * n;
+        if (in > 1) in = 1;
+        if (in < 0) in = 0;
+        core = in * in;
+        *h = 0; *r = 1; *g = 0.55f + 0.45f * core; *b = 0.2f + 0.7f * core * core; *a = in;
+        break;
+    }
+    default:
+        *h = 0; *r = *g = *b = 1;
+    }
+}
+
 static void gen_textures(void)
 {
     int x, y, t;
-    for (t = 0; t < NTEX; t++)
+    for (t = 0; t < NTEX; t++) {
+        float bump = 0, ao = 0;
+        switch (t) {
+        case TX_COBBLE: bump = 5.5f; ao = 0.5f; break;
+        case TX_STONE: case TX_FLAG: bump = 5.0f; ao = 0.45f; break;
+        case TX_BRICK: bump = 4.5f; ao = 0.45f; break;
+        case TX_SLATE: bump = 3.0f; ao = 0.35f; break;
+        case TX_WOOD: bump = 2.5f; ao = 0.3f; break;
+        case TX_PLASTER: bump = 3.0f; ao = 0.3f; break;
+        case TX_METAL: bump = 3.0f; ao = 0.25f; break;
+        case TX_BARK: bump = 4.0f; ao = 0.55f; break;
+        case TX_CLOTH: bump = 1.5f; ao = 0.25f; break;
+        case TX_ROCK: bump = 6.0f; ao = 0.45f; break;
+        case TX_DIRT: bump = 4.0f; ao = 0.35f; break;
+        case TX_GRASS: bump = 3.0f; ao = 0.4f; break;
+        default: break;
+        }
         for (y = 0; y < TSZ; y++)
             for (x = 0; x < TSZ; x++) {
-                float b = 1, r, g, bl, a = 1;
-                uint32_t *px = &texbuf[t * TSZ * TSZ + y * TSZ + x];
-                switch (t) {
-                case TX_COBBLE: {
-                    /* ciottoli irregolari (Voronoi) con fughe e riflessi bagnati */
-                    float f1 = 1e9f, f2 = 1e9f;
-                    int cx = x / 16, cy = y / 16, i, j, id = 0;
-                    for (j = cy - 1; j <= cy + 1; j++)
-                        for (i = cx - 1; i <= cx + 1; i++) {
-                            int wi = (i + 4) % 4, wj = (j + 4) % 4;
-                            float ppx = i * 16 + 3 + hashf(wi, wj, 1) * 10, ppy = j * 16 + 3 + hashf(wi, wj, 2) * 10;
-                            float d = sqrtf((x - ppx) * (x - ppx) + (y - ppy) * (y - ppy));
-                            if (d < f1) { f2 = f1; f1 = d; id = wj * 4 + wi; }
-                            else if (d < f2) f2 = d;
-                        }
-                    {
-                        float e = f2 - f1, bev = e / 6 > 1 ? 1 : e / 6;
-                        b = 0.52f + 0.22f * hashf(id, 0, 3) + 0.3f * (fbm(x, y, 8, 5) - 0.5f);
-                        b *= 0.6f + 0.4f * bev;
-                        if (e < 1.6f) b = 0.16f + 0.1f * fbm(x, y, 16, 7);
-                        if (hashf(x, y, 9) > 0.986f) b += 0.3f;
-                        r = b * 0.94f; g = b * 0.96f; bl = b * 1.04f;
-                    }
-                    break;
-                }
-                case TX_STONE: {
-                    /* conci di pietra sfalsati, crepe e muschio */
-                    int row = y / 16, off = (row & 1) * 16, lx = (x + off) % 32, ly = y % 16, bi = ((x + off) % 64) / 32;
-                    float n = vnoise2(x / 4.0f, y / 4.0f, 16, 16, 7), m = fbm(x, y, 4, 11);
-                    if (lx < 2 || ly < 2) b = 0.2f + 0.08f * fbm(x, y, 16, 3);
-                    else {
-                        b = 0.58f + 0.18f * hashf(bi, row, 4) + 0.32f * (fbm(x, y, 8, 13) - 0.5f);
-                        if (lx < 4 || ly < 4) b *= 0.85f;
-                        if (lx > 29 || ly > 13) b *= 1.08f;
-                        if (fabsf(n - 0.5f) < 0.014f) b *= 0.5f;
-                    }
-                    r = b; g = b * 0.97f; bl = b * 0.95f;
-                    if (m > 0.6f) { r *= 0.8f; g *= 1.05f; bl *= 0.75f; }
-                    break;
-                }
-                case TX_WOOD: {
-                    int pl = x / 16, lx = x % 16;
-                    float gr = 0.5f + 0.5f * sinf(y * 0.22f + fbm(x, y, 4, 15) * 9 + pl * 3);
-                    b = 0.46f + 0.16f * gr + 0.18f * hashf(pl, 0, 5) + 0.14f * (vnoise2(x * 8 / 64.0f, y * 1 / 64.0f, 8, 1, 6) - 0.5f);
-                    if (lx == 0) b = 0.14f;
-                    if (lx == 1) b *= 0.75f;
-                    r = b; g = b * 0.88f; bl = b * 0.76f;
-                    break;
-                }
-                case TX_SLATE: {
-                    int row = y / 8, off = (row & 1) * 4, sx = (x + off) % 8, ly = y % 8;
-                    b = 0.45f + 0.22f * hashf((x + off) / 8, row, 8) + 0.2f * (fbm(x, y, 8, 17) - 0.5f);
-                    b *= 0.7f + 0.3f * (ly / 7.0f);
-                    if (ly == 7 || sx == 0) b = 0.14f;
-                    r = b * 0.9f; g = b * 0.95f; bl = b * 1.06f;
-                    break;
-                }
-                case TX_CLOTH:
-                    b = 0.68f + 0.26f * (fbm(x, y, 4, 21) - 0.5f) + 0.05f * ((x + y) & 1) + 0.1f * sinf(x * 0.2f + fbm(x, y, 2, 23) * 4);
-                    if (hashf(x, y, 25) > 0.97f) b *= 0.8f;
-                    r = g = bl = b;
-                    break;
-                case TX_METAL: {
-                    int lx = x % 32, ly = y % 32;
-                    b = 0.66f + 0.18f * (vnoise2(x * 4 / 64.0f, y * 32 / 64.0f, 4, 32, 31) - 0.5f) + 0.14f * (fbm(x, y, 4, 33) - 0.5f);
-                    if (lx == 0 || ly == 0) b = 0.3f;
-                    if (lx == 1 || ly == 1) b *= 1.2f;
-                    {
-                        int rx = lx - 5, ry = ly - 5;
-                        if (rx * rx + ry * ry <= 3) b = 0.95f;
-                        else if (rx * rx + ry * ry <= 6) b = 0.35f;
-                    }
-                    if (fabsf(vnoise2(x / 8.0f, y / 8.0f, 8, 8, 35) - 0.5f) < 0.01f) b *= 1.3f;
-                    r = b * 0.95f; g = b * 0.97f; bl = b;
-                    break;
-                }
-                case TX_BARK:
-                    b = 0.5f + 0.32f * (vnoise2(x * 8 / 64.0f, y * 2 / 64.0f, 8, 2, 41) - 0.5f) + 0.2f * (fbm(x, y, 8, 43) - 0.5f);
-                    if (vnoise2(x * 16 / 64.0f, y * 2 / 64.0f, 16, 2, 45) < 0.28f) b *= 0.5f;
-                    r = b; g = b * 0.92f; bl = b * 0.85f;
-                    break;
-                case TX_BRICK: {
-                    /* mattoni con fughe, alcuni scheggiati o anneriti */
-                    int row = y / 8, off = (row & 1) * 8, lx = (x + off) % 16, ly = y % 8, bi = (x + off) / 16;
-                    if (lx == 0 || ly == 0) b = 0.3f + 0.1f * fbm(x, y, 16, 61);
-                    else {
-                        b = 0.55f + 0.22f * hashf(bi, row, 62) + 0.22f * (fbm(x, y, 16, 63) - 0.5f);
-                        if (lx == 1 || ly == 1) b *= 1.1f;
-                        if (lx == 15 || ly == 7) b *= 0.82f;
-                        if (hashf(bi, row, 64) > 0.9f) b *= 0.65f;
-                    }
-                    r = b; g = b * 0.9f; bl = b * 0.86f;
-                    break;
-                }
-                case TX_PLASTER: {
-                    /* intonaco macchiato e scrostato, con mattoni a vista */
-                    float n = fbm(x, y, 4, 71), st = fbm(x, y, 8, 73);
-                    b = 0.72f + 0.16f * (st - 0.5f) - 0.12f * (y / 63.0f) * fbm(x, y, 2, 75);
-                    r = b; g = b * 0.97f; bl = b * 0.9f;
-                    if (n > 0.66f) {
-                        int row = y / 6, lx = (x + (row & 1) * 6) % 12;
-                        float bb = (lx == 0 || y % 6 == 0) ? 0.3f : 0.5f + 0.15f * hashf((x + (row & 1) * 6) / 12, row, 77);
-                        r = bb * 1.05f; g = bb * 0.78f; bl = bb * 0.68f;
-                    } else if (n > 0.63f) { r *= 0.7f; g *= 0.7f; bl *= 0.7f; }
-                    if (fabsf(vnoise2(x / 6.0f, y / 6.0f, 11, 11, 79) - 0.5f) < 0.01f) { r *= 0.6f; g *= 0.6f; bl *= 0.6f; }
-                    break;
-                }
-                case TX_FLAG: {
-                    /* lastre del marciapiede */
-                    int row = y / 21, off = (row % 2) * 13, lx = (x + off) % 32, ly = y % 21;
-                    if (lx == 0 || ly == 0 || y >= 63) b = 0.2f;
-                    else {
-                        b = 0.6f + 0.18f * hashf((x + off) / 32, row, 81) + 0.25f * (fbm(x, y, 8, 83) - 0.5f);
-                        if (lx == 1 || ly == 1) b *= 1.12f;
-                        if (fabsf(vnoise2(x / 5.0f, y / 5.0f, 13, 13, 85) - 0.5f) < 0.012f) b *= 0.55f;
-                    }
-                    r = b * 0.97f; g = b * 0.97f; bl = b;
-                    break;
-                }
-                case TX_GRASS:
-                    b = 0.55f + 0.25f * (fbm(x, y, 8, 91) - 0.5f) + 0.22f * (vnoise2(x * 32 / 64.0f, y * 8 / 64.0f, 32, 8, 93) - 0.5f);
-                    if (hashf(x, y, 95) > 0.93f) b *= 1.25f;
-                    if (fbm(x, y, 4, 97) > 0.68f) { r = b * 0.95f; g = b * 0.85f; bl = b * 0.6f; break; }   /* chiazze secche */
-                    r = b * 0.82f; g = b; bl = b * 0.74f;
-                    break;
-                case TX_DIRT:
-                    b = 0.5f + 0.25f * (fbm(x, y, 8, 101) - 0.5f);
-                    if (hashf(x, y, 103) > 0.965f) b += 0.25f;
-                    if (hashf(x, y, 105) > 0.97f) b *= 0.6f;
-                    if (fabsf(vnoise2(x / 8.0f, y / 8.0f, 8, 8, 107) - 0.5f) < 0.02f) b *= 0.75f;   /* solchi */
-                    r = b; g = b * 0.88f; bl = b * 0.74f;
-                    break;
-                case TX_ROCK:
-                    b = 0.55f + 0.22f * (fbm(x, y, 8, 111) - 0.5f) + 0.13f * sinf(y * 0.4f + fbm(x, y, 4, 113) * 7);
-                    if (fabsf(vnoise2(x / 6.0f, y / 6.0f, 11, 11, 115) - 0.5f) < 0.015f) b *= 0.45f;
-                    if (fbm(x, y, 4, 117) > 0.66f) { r = b * 0.82f; g = b * 0.95f; bl = b * 0.75f; break; }  /* licheni */
-                    r = b * 0.96f; g = b * 0.97f; bl = b;
-                    break;
-                case TX_GLOW: {
-                    float dx = (x - 31.5f) / 31.5f, dy = (y - 31.5f) / 31.5f, d = sqrtf(dx * dx + dy * dy);
-                    float k = 1 - d;
-                    if (k < 0) k = 0;
-                    r = g = bl = 1; a = k * k;
-                    break;
-                }
-                case TX_WINDOW: {
-                    /* vetrata ad arco acuto con piombature */
-                    int inside, dx = x - 32;
-                    float fy = y / 63.0f, dist;
-                    if (y >= 22) { inside = dx >= -26 && dx <= 26; dist = 26 - (float)(dx < 0 ? -dx : dx); }
-                    else {
-                        float dl = sqrtf((float)((x - 58) * (x - 58) + (y - 22) * (y - 22)));
-                        float dr = sqrtf((float)((x - 6) * (x - 6) + (y - 22) * (y - 22)));
-                        dist = 52 - (dx < 0 ? dl : dr);
-                        inside = dist > 0 && y > 0;
-                    }
-                    if (y > 61) { inside = 0; }
-                    if (!inside || dist < 3) { r = g = bl = 0.1f; break; }
-                    b = 0.8f + 0.2f * fbm(x, y, 4, 51);
-                    r = b; g = b * (0.7f + 0.2f * fy); bl = b * (0.35f + 0.25f * fy);
-                    if ((dx < 2 && dx > -2) || (y - 38 < 2 && y - 38 > -2)) { r = g = bl = 0.08f; }
-                    else if (x % 8 == 0 || y % 9 == 0) { r *= 0.55f; g *= 0.55f; bl *= 0.55f; }
-                    break;
-                }
-                case TX_FIRE: {
-                    /* lingue di fuoco: strisce allungate nel verso del movimento, piu' dense verso il filo */
-                    float v = y / (float)(TSZ - 1), n, edge, in, core;
-                    n = 0.6f * vnoise2(x * 3 / (float)TSZ, y * 9 / (float)TSZ, 3, 9, 71) + 0.4f * vnoise2(x * 7 / (float)TSZ, y * 18 / (float)TSZ, 7, 18, 73);
-                    edge = v + (n - 0.5f) * 0.55f;
-                    in = (v < 0.3f ? v / 0.3f : 1) * (edge > 0.7f ? (edge > 1.0f ? 0 : (1.0f - edge) / 0.3f) : 1);
-                    in *= 0.55f + 0.6f * n;
-                    if (in > 1) in = 1;
-                    if (in < 0) in = 0;
-                    core = in * in;
-                    r = 1; g = 0.55f + 0.45f * core; bl = 0.2f + 0.7f * core * core; a = in;
-                    break;
-                }
-                default:
-                    r = g = bl = 1;
-                }
-                *px = pack(r, g, bl, a);
+                float h, r, g, b, a;
+                material(t, (x + 0.5f) / TSZ, (y + 0.5f) / TSZ, x, y, &h, &r, &g, &b, &a);
+                tH[y * TSZ + x] = h; tR[y * TSZ + x] = r; tG[y * TSZ + x] = g; tB[y * TSZ + x] = b;
+                texbuf[t * TSZ * TSZ + y * TSZ + x] = pack(r, g, b, a);
             }
+        if (bump > 0)
+            /* il rilievo viene illuminato: luce radente da in alto a sinistra, cavita' piu' scure */
+            for (y = 0; y < TSZ; y++)
+                for (x = 0; x < TSZ; x++) {
+                    int xl = (x + TSZ - 1) % TSZ, xr = (x + 1) % TSZ, yu = (y + TSZ - 1) % TSZ, yd = (y + 1) % TSZ;
+                    float h = tH[y * TSZ + x];
+                    float dx = (tH[y * TSZ + xl] - tH[y * TSZ + xr]) * bump, dy = (tH[yu * TSZ + x] - tH[yd * TSZ + x]) * bump;
+                    float sh = 1.0f + dx * 0.55f + dy * 0.7f, cav = 1 - ao + ao * h;
+                    if (sh < 0.35f) sh = 0.35f;
+                    if (sh > 1.6f) sh = 1.6f;
+                    sh *= cav * 1.12f;
+                    texbuf[t * TSZ * TSZ + y * TSZ + x] = pack(tR[y * TSZ + x] * sh, tG[y * TSZ + x] * sh, tB[y * TSZ + x] * sh, 1);
+                }
+    }
     r_textures(texbuf, NTEX, TSZ);
 }
 
@@ -2848,6 +2986,7 @@ static int pb_rolling;
 /* colonna vertebrale del personaggio: torsione del busto, peso spostato sui fianchi, spalle inclinate.
  * i piedi restano fermi a terra, il busto ruota, la testa compensa e resta piu' stabile */
 static int pb_body;
+static float pb_rollC = 1, pb_rollF;   /* compressione e centro della capriola */
 static float pb_tw, pb_sway, pb_tilt, pb_bank, pb_hipU = 11, pb_shU = 17.4f, pb_wover = -9;
 static void body_bend(float *lf, float lu, float *ls)
 {
@@ -2866,10 +3005,12 @@ static V3 L2W(float lf, float lu, float ls)
 {
     if (pb_body) body_bend(&lf, lu, &ls);
     if (pb_rolling) {
-        float df = lf, du = lu - 5.5f, ca = cosf(pb_roll), sa = sinf(pb_roll);
-        du *= 0.75f;
-        lf = df * ca + du * sa;
-        lu = 5.5f + (-df * sa + du * ca);
+        /* capriola raccolta: il corpo si compatta attorno al baricentro e ruota; nulla scende sotto terra */
+        float df = lf - pb_rollF, du = lu - 6.2f, ca = cosf(pb_roll), sa = sinf(pb_roll);
+        du *= pb_rollC; df *= 0.5f + 0.5f * pb_rollC;
+        lf = pb_rollF + df * ca + du * sa;
+        lu = 6.2f + (-df * sa + du * ca);
+        if (lu < 0.3f) lu = 0.3f;
     }
     return v3(pb_x + pb_c * lf - pb_s * ls, lu + pb_y, pb_z + pb_s * lf + pb_c * ls);
 }
@@ -2938,14 +3079,20 @@ static void tri_v(V3 a, uint32_t ca, float ua, float va, V3 b, uint32_t cb, floa
 
 /* cilindro a sezione ellittica lungo un segmento (w = semiasse laterale, d = frontale),
  * che si assottiglia di limb_taper verso b; ombreggiatura morbida per vertice */
+static float limb_bulge;   /* rigonfiamento a meta' (muscoli, piastre bombate) */
+static int caps_near;      /* nemici vicini: anche loro con forme arrotondate */
 static void limb(V3 a, V3 b, float w, float d, uint32_t col)
 {
     float ax = b.x - a.x, ay = b.y - a.y, az = b.z - a.z, len = sqrtf(ax * ax + ay * ay + az * az) + 0.0001f;
     float rx = -pb_s, rz = pb_c, dp, sx, sy, sz, sl, fx, fy, fz, tp = limb_taper;
     int seg = lo_detail ? 5 : (w + d > 1.5f) ? (hi_detail ? 12 : 9) : ((w + d > 0.6f) ? (hi_detail ? 9 : 7) : (hi_detail ? 5 : 4)), k, tex = cur_tex;
+    /* sul personaggio le parti grandi diventano "capsule": estremita' arrotondate e profilo bombato, niente tubi tagliati */
+    int caps = (hi_detail || caps_near) && !lo_detail && w + d > 0.6f && tp > 0.6f, nr, r;
     float ts = cur_ts, vlen = ts > 0 ? len / ts : 1;
-    V3 ra[15], rb[15];
-    uint32_t ca[15], cb[15];
+    float rt[8], rsc[8], roff[8], rax[8];
+    V3 ring[8][15];
+    uint32_t rcol[8][15];
+    float cs[15], sn2[15];
     ax /= len; ay /= len; az /= len;
     dp = rx * ax + rz * az;
     sx = rx - ax * dp; sy = -ay * dp; sz = rz - az * dp;
@@ -2953,28 +3100,53 @@ static void limb(V3 a, V3 b, float w, float d, uint32_t col)
     if (sl < 0.01f) { sx = 1; sy = 0; sz = 0; sl = 1; }
     sx /= sl; sy /= sl; sz /= sl;
     fx = ay * sz - az * sy; fy = az * sx - ax * sz; fz = ax * sy - ay * sx;
-    for (k = 0; k <= seg; k++) {
-        float t = 2 * PI * k / seg, c = cosf(t), sn = sinf(t);
-        float ox = sx * w * c + fx * d * sn, oy = sy * w * c + fy * d * sn, oz = sz * w * c + fz * d * sn;
-        float nx = sx * c / w + fx * sn / d, ny = sy * c / w + fy * sn / d, nz = sz * c / w + fz * sn / d;
-        float nl = sqrtf(nx * nx + ny * ny + nz * nz) + 0.0001f, sh;
-        nx /= nl; ny /= nl; nz /= nl;
-        sh = soft_shade(nx, ny, nz);
-        ra[k] = v3(a.x + ox, a.y + oy, a.z + oz);
-        rb[k] = v3(b.x + ox * tp, b.y + oy * tp, b.z + oz * tp);
-        if (mat_metal) { ca[k] = metal_col(col, nx, ny, nz, ra[k]); cb[k] = metal_col(col, nx, ny, nz, rb[k]); }
-        else { ca[k] = rim_add(lit(col, sh * 0.9f), nx, ny, nz, ra[k]); cb[k] = rim_add(lit(col, sh), nx, ny, nz, rb[k]); }
+    if (caps) {
+        float rr = (w + d) * 0.5f, bu = limb_bulge;
+        seg = (w + d > 1.5f) ? 10 : 8;
+        nr = 6;
+        /* anelli: tappo arrotondato, corpo (con rigonfiamento), tappo arrotondato */
+        rt[0] = 0; rsc[0] = 0.55f; roff[0] = -rr * 0.4f; rax[0] = -0.75f;
+        rt[1] = 0; rsc[1] = 0.95f; roff[1] = -rr * 0.1f; rax[1] = -0.3f;
+        rt[2] = 0.33f; rsc[2] = 1.0f + bu * 0.87f; roff[2] = 0; rax[2] = -bu;
+        rt[3] = 0.66f; rsc[3] = 1.0f + bu * 0.87f; roff[3] = 0; rax[3] = bu;
+        rt[4] = 1; rsc[4] = 0.95f; roff[4] = rr * 0.1f * tp; rax[4] = 0.3f;
+        rt[5] = 1; rsc[5] = 0.55f; roff[5] = rr * 0.4f * tp; rax[5] = 0.75f;
+    } else {
+        nr = 2;
+        rt[0] = 0; rsc[0] = 1; roff[0] = 0; rax[0] = 0;
+        rt[1] = 1; rsc[1] = 1; roff[1] = 0; rax[1] = 0;
     }
-    for (k = 0; k < seg; k++) {
-        float u0 = (float)k / seg, u1 = (float)(k + 1) / seg;
-        tri_v(ra[k], ca[k], u0, vlen, ra[k + 1], ca[k + 1], u1, vlen, rb[k + 1], cb[k + 1], u1, 0, tex);
-        tri_v(ra[k], ca[k], u0, vlen, rb[k + 1], cb[k + 1], u1, 0, rb[k], cb[k], u0, 0, tex);
+    for (k = 0; k <= seg; k++) { float t = 2 * PI * k / seg; cs[k] = cosf(t); sn2[k] = sinf(t); }
+    for (r = 0; r < nr; r++) {
+        float sc = rsc[r] * (1 + (tp - 1) * rt[r]);
+        float cx = a.x + (b.x - a.x) * rt[r] + ax * roff[r], cy = a.y + (b.y - a.y) * rt[r] + ay * roff[r], cz = a.z + (b.z - a.z) * rt[r] + az * roff[r];
+        for (k = 0; k <= seg; k++) {
+            float c = cs[k], sn = sn2[k];
+            float ox = (sx * w * c + fx * d * sn) * sc, oy = (sy * w * c + fy * d * sn) * sc, oz = (sz * w * c + fz * d * sn) * sc;
+            float nx = sx * c / w + fx * sn / d, ny = sy * c / w + fy * sn / d, nz = sz * c / w + fz * sn / d;
+            float nl = sqrtf(nx * nx + ny * ny + nz * nz) + 0.0001f, sh;
+            nx = nx / nl + ax * rax[r]; ny = ny / nl + ay * rax[r]; nz = nz / nl + az * rax[r];
+            nl = sqrtf(nx * nx + ny * ny + nz * nz) + 0.0001f;
+            nx /= nl; ny /= nl; nz /= nl;
+            ring[r][k] = v3(cx + ox, cy + oy, cz + oz);
+            if (mat_metal) rcol[r][k] = metal_col(col, nx, ny, nz, ring[r][k]);
+            else { sh = soft_shade(nx, ny, nz); rcol[r][k] = rim_add(lit(col, sh * (0.9f + 0.1f * rt[r])), nx, ny, nz, ring[r][k]); }
+        }
     }
-    {   /* tappi */
-        uint32_t ct = lit(col, soft_shade(ax, ay, az)), cbt = lit(col, soft_shade(-ax, -ay, -az));
+    for (r = 0; r < nr - 1; r++)
         for (k = 0; k < seg; k++) {
-            tri_v(b, ct, 0.5f, 0.5f, rb[k], cb[k], 0, 0, rb[k + 1], cb[k + 1], 1, 0, tex);
-            tri_v(a, cbt, 0.5f, 0.5f, ra[k + 1], ca[k + 1], 1, 0, ra[k], ca[k], 0, 0, tex);
+            float u0 = (float)k / seg, u1 = (float)(k + 1) / seg, v0 = vlen * (1 - rt[r]), v1 = vlen * (1 - rt[r + 1]);
+            tri_v(ring[r][k], rcol[r][k], u0, v0, ring[r][k + 1], rcol[r][k + 1], u1, v0, ring[r + 1][k + 1], rcol[r + 1][k + 1], u1, v1, tex);
+            tri_v(ring[r][k], rcol[r][k], u0, v0, ring[r + 1][k + 1], rcol[r + 1][k + 1], u1, v1, ring[r + 1][k], rcol[r + 1][k], u0, v1, tex);
+        }
+    {   /* tappi */
+        V3 pa = caps ? v3(a.x - ax * (w + d) * 0.36f, a.y - ay * (w + d) * 0.36f, a.z - az * (w + d) * 0.36f) : a;
+        V3 pb = caps ? v3(b.x + ax * (w + d) * 0.36f * tp, b.y + ay * (w + d) * 0.36f * tp, b.z + az * (w + d) * 0.36f * tp) : b;
+        uint32_t ct = mat_metal ? metal_col(col, ax, ay, az, pb) : lit(col, soft_shade(ax, ay, az));
+        uint32_t cbt = mat_metal ? metal_col(col, -ax, -ay, -az, pa) : lit(col, soft_shade(-ax, -ay, -az));
+        for (k = 0; k < seg; k++) {
+            tri_v(pb, ct, 0.5f, 0.5f, ring[nr - 1][k], rcol[nr - 1][k], 0, 0, ring[nr - 1][k + 1], rcol[nr - 1][k + 1], 1, 0, tex);
+            tri_v(pa, cbt, 0.5f, 0.5f, ring[0][k + 1], rcol[0][k + 1], 1, 0, ring[0][k], rcol[0][k], 0, 0, tex);
         }
     }
 }
@@ -2987,7 +3159,7 @@ static void blobL(float cf, float cu, float cs, float rf, float ru, float rs, ui
     uint32_t cc[17][21];
     float ctab[21], stab[21];
     int r, k, tex = cur_tex;
-    if (hi_detail) { rings = rings * 5 / 4; segs = segs * 5 / 4; }
+    if (hi_detail) { segs = segs * 9 / 8; }
     if (lo_detail) { rings = rings > 4 ? rings / 2 + 1 : 3; segs = segs > 7 ? segs / 2 + 1 : 5; }
     if (rings > 16) rings = 16;
     if (segs > 20) segs = 20;
@@ -3229,11 +3401,20 @@ static void draw_prop(int t, int tx, int ty, unsigned h)
     light_at(cx, cz);
     switch (t) {
     case T_LAMP:
+        /* lampione in ghisa: base a campana, fusto rastremato con anelli, braccetti ricurvi */
+        pb_x = cx; pb_z = cz; pb_c = 1; pb_s = 0; pb_rolling = 0; pb_y = cur_gy;
         TEXS(TX_METAL, 12);
-        box(cx, 0, cz, 1.9f, 3, 1.9f, 0.785f, RGB(70, 70, 80), RGB(80, 80, 90), 1, 0);
-        box(cx, 3, cz, 0.7f, 28, 0.7f, 0, RGB(64, 64, 74), RGB(64, 64, 74), 1, 0);
-        box(cx, 12, cz, 1.1f, 1, 1.1f, 0.785f, RGB(70, 70, 80), RGB(70, 70, 80), 1, 0);
-        box(cx, 29, cz, 3.2f, 0.8f, 0.6f, 0, RGB(64, 64, 74), RGB(64, 64, 74), 1, 0);
+        mat_metal = 1;
+        limb_taper = 0.55f;
+        limbL(0, 0, 0, 0, 4, 0, 2.2f, 2.2f, RGB(70, 70, 80));
+        limb_taper = 0.75f;
+        limbL(0, 4, 0, 0, 30, 0, 0.75f, 0.75f, RGB(64, 64, 74));
+        limb_taper = 1.0f;
+        blobL(0, 12, 0, 1.0f, 0.5f, 1.0f, RGB(76, 76, 86), 3, 8);
+        blobL(0, 4.2f, 0, 1.3f, 0.6f, 1.3f, RGB(76, 76, 86), 3, 8);
+        limbL(0, 28, 0, 2.6f, 29.5f, 0, 0.3f, 0.3f, RGB(64, 64, 74));
+        limbL(0, 28, 0, -2.6f, 29.5f, 0, 0.3f, 0.3f, RGB(64, 64, 74));
+        mat_metal = 0;
         TEXS(TX_WHITE, 32);
         box(cx, 31, cz, 2.0f, 5, 2.0f, 0.785f, RGB(255, 205, 130), RGB(255, 225, 160), 1, 1);
         TEXS(TX_METAL, 12);
@@ -3263,8 +3444,10 @@ static void draw_prop(int t, int tx, int ty, unsigned h)
             box(cx, 0, cz - 2, 1.2f, 13, 1.0f, yaw, RGB(118, 116, 122), RGB(140, 138, 144), 1, 0);
             box(cx, 8, cz - 2, 1.2f, 1.6f, 4.0f, yaw, RGB(118, 116, 122), RGB(140, 138, 144), 1, 0);
         } else {
-            box(cx, 0, cz - 2, 1.5f, 9, 4.2f, yaw, RGB(112, 110, 118), RGB(130, 128, 136), 1, 0);
-            box(cx, 9, cz - 2, 1.5f, 2, 2.8f, yaw, RGB(112, 110, 118), RGB(130, 128, 136), 1, 0);
+            /* lapide ad arco, un po' inclinata e consumata */
+            box(cx, 0, cz - 2, 1.5f, 8, 4.2f, yaw, RGB(112, 110, 118), RGB(130, 128, 136), 1, 0);
+            pb_x = cx; pb_z = cz - 2; pb_c = cosf(yaw); pb_s = sinf(yaw); pb_rolling = 0; pb_y = cur_gy;
+            blobL(0, 8, 0, 1.5f, 3.2f, 4.2f, RGB(116, 114, 122), 4, 10);
         }
         break;
     case T_CRATE:
@@ -3283,14 +3466,40 @@ static void draw_prop(int t, int tx, int ty, unsigned h)
         break;
     case T_TREE: {
         int i;
+        /* albero morto: tronco contorto che si divide in rami sempre piu' sottili */
+        float bx2 = ((int)(h % 7) - 3) * 0.6f, bz2 = ((int)((h >> 4) % 7) - 3) * 0.6f;
+        uint32_t bk = RGB(84, 72, 64);
+        pb_x = cx; pb_z = cz; pb_c = 1; pb_s = 0; pb_rolling = 0; pb_y = cur_gy;
         TEXS(TX_BARK, 10);
-        box(cx, 0, cz, 2.3f, 30, 2.3f, 0.3f, RGB(84, 72, 64), RGB(84, 72, 64), 1, 0);
-        box(cx, 0, cz, 3.4f, 3, 3.4f, 0.9f, RGB(80, 68, 60), RGB(80, 68, 60), 1, 0);
-        for (i = 0; i < 6; i++) {
-            float a = i * 2.3f + (h % 5), l = 6 + (i % 3) * 2.5f, y = 14 + i * 3.2f;
-            box(cx + cosf(a) * l, y, cz + sinf(a) * l, l, 1.2f, 0.8f, a, RGB(84, 72, 64), RGB(96, 84, 74), 1, 0);
-            box(cx + cosf(a) * l * 2, y + 1, cz + sinf(a) * l * 2, l * 0.4f, 0.8f, 0.6f, a + 0.6f, RGB(84, 72, 64), RGB(96, 84, 74), 1, 0);
+        limb_taper = 0.8f;
+        limbL(0, 0, 0, bx2, 12, bz2, 2.6f, 2.6f, bk);
+        limb_taper = 0.7f;
+        limbL(bx2, 12, bz2, -bx2 * 0.5f, 24, -bz2 * 0.5f, 2.1f, 2.1f, bk);
+        limb_taper = 1.0f;
+        if (ex * ex + ez * ez > 110 * 110) {   /* da lontano: solo tronco e tre rami */
+            for (i = 0; i < 3; i++) {
+                float a = i * 2.1f + (h % 5);
+                limb_taper = 0.4f;
+                limbL(bx2 * 0.5f, 14 + i * 3, bz2 * 0.5f, cosf(a) * 9, 20 + i * 3, sinf(a) * 9, 0.9f, 0.9f, bk);
+            }
+            limb_taper = 1.0f;
+            break;
         }
+        for (i = 0; i < 3; i++) {   /* radici */
+            float a = i * 2.1f + (h % 3);
+            limb_taper = 0.4f;
+            limbL(0, 1.5f, 0, cosf(a) * 5, -0.3f, sinf(a) * 5, 1.4f, 1.1f, shade(bk, 0.9f));
+        }
+        for (i = 0; i < 5; i++) {
+            float a = i * 2.4f + (h % 5), y = 11 + i * 3.2f, l = 7 + (i % 3) * 2.5f;
+            float t2 = (y - 12) / 12, ox = i < 2 ? bx2 * (y / 12) : bx2 + (-bx2 * 1.5f) * t2, oz = i < 2 ? bz2 * (y / 12) : bz2 + (-bz2 * 1.5f) * t2;
+            float ex2 = ox + cosf(a) * l, ey2 = y + 3 + (i % 2) * 3, ez2 = oz + sinf(a) * l;
+            limb_taper = 0.45f;
+            limbL(ox, y, oz, ex2, ey2, ez2, 1.0f, 1.0f, bk);
+            limbL(ex2, ey2, ez2, ex2 + cosf(a + 0.7f) * l * 0.6f, ey2 + 2.5f, ez2 + sinf(a + 0.7f) * l * 0.6f, 0.45f, 0.45f, shade(bk, 1.05f));
+            limbL(ex2, ey2, ez2, ex2 + cosf(a - 0.6f) * l * 0.5f, ey2 - 1.0f, ez2 + sinf(a - 0.6f) * l * 0.5f, 0.4f, 0.4f, shade(bk, 1.05f));
+        }
+        limb_taper = 1.0f;
         break;
     }
     case T_WELL:
@@ -3343,17 +3552,90 @@ static void cone(float x, float y, float z, float r, float h, uint32_t col, int 
     }
 }
 
+/* roccia naturale: ellissoide deformato da rumore, appiattito alla base (usa la trasformazione pb_*) */
+static void rockL(float cf, float cu, float cs, float rf, float ru, float rs, unsigned seed, uint32_t col, int rings, int segs)
+{
+    V3 pos[9][13];
+    uint32_t cc[9][13];
+    float p1 = (seed % 628) * 0.01f, p2 = ((seed >> 8) % 628) * 0.01f, p3 = ((seed >> 16) % 628) * 0.01f;
+    int r, k, tex = cur_tex;
+    if (lo_detail) { rings = 3; segs = 6; }
+    if (rings > 8) rings = 8;
+    if (segs > 12) segs = 12;
+    for (r = 0; r <= rings; r++) {
+        float th = PI * r / rings, st = sinf(th), ct = cosf(th);
+        for (k = 0; k <= segs; k++) {
+            float ph = 2 * PI * (k % segs) / segs, cp = cosf(ph), sp = sinf(ph);
+            float f = 0.82f + 0.2f * sinf(3 * ph + p1) * sinf(2 * th + p2) + 0.12f * sinf(5 * ph + 3 * th + p3);
+            float lf = st * cp * f, lu = ct * f, ls = st * sp * f, wx, wz, nl;
+            float nf = lf / rf, nu = lu / ru, ns = ls / rs;
+            if (lu < -0.35f) lu = -0.35f;          /* base piatta, appoggiata al terreno */
+            nl = sqrtf(nf * nf + nu * nu + ns * ns) + 0.0001f;
+            nf /= nl; nu /= nl; ns /= nl;
+            wx = pb_c * nf - pb_s * ns; wz = pb_s * nf + pb_c * ns;
+            pos[r][k] = L2W(cf + lf * rf, cu + lu * ru, cs + ls * rs);
+            cc[r][k] = lit(col, soft_shade(wx, nu, wz) * (0.9f + 0.1f * f));
+        }
+    }
+    for (r = 0; r < rings; r++)
+        for (k = 0; k < segs; k++) {
+            float u0 = (float)k / segs * 2, u1 = (float)(k + 1) / segs * 2, v0 = (float)r / rings, v1 = (float)(r + 1) / rings;
+            tri_v(pos[r][k], cc[r][k], u0, v0, pos[r][k + 1], cc[r][k + 1], u1, v0, pos[r + 1][k + 1], cc[r + 1][k + 1], u1, v1, tex);
+            tri_v(pos[r][k], cc[r][k], u0, v0, pos[r + 1][k + 1], cc[r + 1][k + 1], u1, v1, pos[r + 1][k], cc[r + 1][k], u0, v1, tex);
+        }
+}
+
+/* palco di rami di abete: bordo frastagliato con punte che ricadono, sotto piu' scuro */
+static void ragged_cone(float x, float y, float z, float r, float h, uint32_t col, int seg, unsigned seed)
+{
+    int k, tex = cur_tex;
+    V3 ap = v3(x + ((int)(seed % 7) - 3) * 0.08f * r, y + h + cur_gy, z + ((int)((seed >> 3) % 7) - 3) * 0.08f * r);
+    V3 rim[17];
+    uint32_t rc[17], ca = lit(col, 1.1f), cu = lit(shade(col, 0.55f), 0.45f);
+    if (seg > 16) seg = 16;
+    for (k = 0; k <= seg; k++) {
+        int kk = k % seg;
+        float a = 2 * PI * kk / seg + (seed % 10) * 0.05f, tip = (kk & 1) ? 1.0f : 0.72f;
+        float rr = r * tip * (0.88f + 0.24f * hashf(kk, seed & 255, 3));
+        rim[k] = v3(x + cosf(a) * rr, y + cur_gy - (kk & 1 ? r * 0.22f : 0), z + sinf(a) * rr);
+        rc[k] = lit(col, soft_shade(cosf(a) * 0.8f, 0.45f, sinf(a) * 0.8f) * (kk & 1 ? 0.92f : 1.0f));
+    }
+    for (k = 0; k < seg; k++) {
+        tri_v(ap, ca, 0.5f, 0, rim[k], rc[k], (float)k / seg * 2, 1, rim[k + 1], rc[k + 1], (float)(k + 1) / seg * 2, 1, tex);
+        tri_v(v3(x, y + cur_gy + h * 0.15f, z), cu, 0.5f, 0.5f, rim[k + 1], cu, 0, 0, rim[k], cu, 1, 0, tex);
+    }
+}
+
 static void draw_pine(float cx, float cz, unsigned h)
 {
     float s = 0.85f + (h % 5) * 0.08f, yaw = (h % 7) * 0.3f;
     uint32_t fol = (h % 3 == 0) ? RGB(58, 74, 62) : ((h % 3 == 1) ? RGB(66, 78, 64) : RGB(54, 66, 60));
+    float ex = cx - camEye.x, ez = cz - camEye.z, far = ex * ex + ez * ez > 95 * 95;
+    float lx = ((int)(h % 9) - 4) * 0.035f, lz = ((int)((h >> 5) % 9) - 4) * 0.035f;   /* leggera inclinazione */
+    (void)yaw;
+    pb_x = cx; pb_z = cz; pb_c = 1; pb_s = 0; pb_rolling = 0; pb_y = cur_gy;
     TEXS(TX_BARK, 8);
-    box(cx, 0, cz, 1.1f * s, 14 * s, 1.1f * s, yaw, RGB(96, 80, 70), RGB(96, 80, 70), 1, 0);
+    limb_taper = 0.35f;
+    limbL(0, 0, 0, lx * 20 * s, 26 * s, lz * 20 * s, 1.5f * s, 1.5f * s, RGB(92, 76, 66));     /* tronco rastremato */
+    limb_taper = 1.0f;
+    if (ex * ex + ez * ez < 60 * 60) {   /* radici che affiorano */
+        int k;
+        for (k = 0; k < 3; k++) {
+            float a = k * 2.1f + (h % 5);
+            limbL(0, 1.2f, 0, cosf(a) * 3.2f * s, -0.2f, sinf(a) * 3.2f * s, 0.7f * s, 0.5f * s, RGB(86, 72, 62));
+        }
+    }
     TEXS(TX_GRASS, 6);
-    cone(cx, 6 * s, cz, 8.5f * s, 11 * s, fol, 8);
-    cone(cx, 12 * s, cz, 6.8f * s, 10 * s, shade(fol, 1.05f), 8);
-    cone(cx, 18 * s, cz, 4.8f * s, 9 * s, shade(fol, 1.1f), 7);
-    cone(cx, 24 * s, cz, 2.6f * s, 7 * s, shade(fol, 1.15f), 6);
+    if (far) {
+        cone(cx + lx * 5, 5 * s, cz + lz * 5, 8.5f * s, 13 * s, fol, 7);
+        cone(cx + lx * 12, 14 * s, cz + lz * 12, 5.6f * s, 13 * s, shade(fol, 1.1f), 6);
+    } else {
+        int k;
+        for (k = 0; k < 4; k++) {
+            float t = k / 3.0f, yy = (4.5f + k * 6.0f) * s;
+            ragged_cone(cx + lx * yy * 0.77f, yy, cz + lz * yy * 0.77f, (9.2f - 6.4f * t) * s, (9.5f - 2.5f * t) * s, shade(fol, 0.92f + 0.08f * k), 10, h + k * 17);
+        }
+    }
 }
 
 static void draw_boulder(float cx, float cz, unsigned h)
@@ -3361,9 +3643,9 @@ static void draw_boulder(float cx, float cz, unsigned h)
     float s = 0.8f + (h % 4) * 0.2f;
     pb_x = cx; pb_z = cz; pb_c = cosf(h * 0.1f); pb_s = sinf(h * 0.1f); pb_rolling = 0; pb_y = cur_gy;
     TEXS(TX_ROCK, 8);
-    blobL(0, 2.5f * s, 0, 6.5f * s, 5.0f * s, 5.5f * s, RGB(116, 114, 118), 5, 8);
-    blobL(3 * s, 1.5f * s, 2 * s, 3.5f * s, 3.0f * s, 3.0f * s, RGB(106, 104, 108), 4, 7);
-    if (h % 2) blobL(-3 * s, 1 * s, -3 * s, 2.5f * s, 2.0f * s, 2.2f * s, RGB(100, 100, 104), 3, 6);
+    rockL(0, 2.0f * s, 0, 6.8f * s, 5.2f * s, 5.8f * s, h, RGB(116, 114, 118), 6, 10);
+    rockL(3.5f * s, 1.0f * s, 2.5f * s, 3.6f * s, 3.0f * s, 3.2f * s, h * 7 + 1, RGB(106, 104, 108), 4, 8);
+    if (h % 2) rockL(-3.5f * s, 0.6f * s, -3 * s, 2.6f * s, 2.0f * s, 2.3f * s, h * 13 + 2, RGB(100, 100, 104), 4, 7);
 }
 
 static void draw_ruin(int tx, int ty, unsigned h)
@@ -3381,10 +3663,36 @@ static void draw_ruin(int tx, int ty, unsigned h)
         box(cx + 3, 0, cz + 4, 2.5f, 2.5f, 1.6f, 0.6f, RGB(118, 114, 112), RGB(126, 122, 120), 1, 0);
         return;
     }
-    box(cx, 0, cz, 8, hh, 8, 0, RGB(112, 108, 106), RGB(96, 100, 92), 1, 0);
-    /* blocchi sbrecciati in cima e macerie alla base */
-    box(cx + ((h >> 3) % 9) - 4.0f, hh, cz + ((h >> 6) % 9) - 4.0f, 3.5f, 3 + (h % 4), 3.5f, h * 0.1f, RGB(112, 108, 106), RGB(96, 104, 90), 1, 0);
-    if (h % 3 == 0) box(cx + 9, 0, cz - 3, 2.2f, 2, 1.8f, 0.5f, RGB(108, 104, 102), RGB(108, 104, 102), 1, 0);
+    {
+        /* muro in corsi di conci irregolari: ogni blocco leggermente spostato e ruotato, i corsi alti si sgretolano */
+        float ex = cx - camEye.x, ez = cz - camEye.z;
+        if (ex * ex + ez * ez > 120 * 120) box(cx, 0, cz, 8, hh, 8, 0, RGB(112, 108, 106), RGB(96, 100, 92), 1, 0);
+        else {
+            int c2, nc = (int)(hh / 4.5f) + 1, b2;
+            float y2 = 0;
+            for (c2 = 0; c2 < nc; c2++) {
+                float ch = hh / nc;
+                for (b2 = 0; b2 < 2; b2++) {
+                    unsigned hb = hash2(h + c2 * 31, b2 * 7 + 3);
+                    float jx = ((int)(hb % 9) - 4) * 0.12f, jz = ((int)((hb >> 4) % 9) - 4) * 0.12f, rot = ((int)((hb >> 8) % 9) - 4) * 0.015f;
+                    float shrink = c2 >= nc - 1 ? 0.7f + (hb % 4) * 0.08f : 1.0f;
+                    int vert = (c2 & 1);
+                    float ox = vert ? 0 : (b2 ? 4.1f : -4.1f), oz = vert ? (b2 ? 4.1f : -4.1f) : 0;
+                    uint32_t cs = RGB(104 + (int)(hb % 16), 100 + (int)(hb % 16), 98 + (int)(hb % 14));
+                    if (c2 == nc - 1 && (hb & 3) == 0) continue;           /* blocco caduto */
+                    box(cx + ox + jx, y2, cz + oz + jz, (vert ? 8.1f : 4.0f) * shrink, ch * (c2 == nc - 1 ? shrink : 1) - 0.25f,
+                        (vert ? 4.0f : 8.1f) * shrink, rot, cs, shade(cs, 0.92f), 1, 0);
+                }
+                y2 += ch;
+            }
+        }
+    }
+    {   /* cima sbrecciata irregolare e macerie arrotondate alla base */
+        pb_x = cx; pb_z = cz; pb_c = cosf(h * 0.2f); pb_s = sinf(h * 0.2f); pb_rolling = 0; pb_y = cur_gy;
+        rockL(((h >> 3) % 7) - 3.0f, hh + 0.5f, ((h >> 6) % 7) - 3.0f, 5.0f, 2.5f + (h % 3), 4.5f, h, RGB(112, 108, 106), 4, 8);
+        rockL(9, 0.8f, -3, 2.6f, 1.8f, 2.2f, h * 5 + 3, RGB(108, 104, 102), 3, 6);
+        if (h % 2) rockL(-8, 0.6f, 5, 2.0f, 1.4f, 1.8f, h * 11 + 7, RGB(104, 100, 98), 3, 6);
+    }
     if (hh > 20 && h % 2) {
         /* finestra ad arco vuota */
         TEXS(TX_WHITE, 32);
@@ -3410,6 +3718,16 @@ static void draw_tufts(float x0, float z0, unsigned h)
     }
 }
 
+static int grassy(int x, int y)
+{
+    int t;
+    if (x < 0 || y < 0 || x >= MW || y >= MH) return 1;
+    t = map[y][x];
+    return t == T_GRASS || t == T_PINE || t == T_BOULDER || t == T_TREE || t == T_GRAVE || t == T_ROCK;
+}
+/* quanta erba c'e' attorno a un vertice della griglia (media delle 4 caselle che lo toccano) */
+static float grass_w(int x, int y) { return (grassy(x - 1, y - 1) + grassy(x, y - 1) + grassy(x - 1, y) + grassy(x, y)) * 0.25f; }
+
 static void draw_outdoor(int tx, int ty, int t, unsigned h)
 {
     float x0 = (float)tx * TS, z0 = (float)ty * TS, cx = x0 + 8, cz = z0 + 8;
@@ -3423,6 +3741,26 @@ static void draw_outdoor(int tx, int ty, int t, unsigned h)
     if (t == T_ROCK) { tex = TX_ROCK; ts = 20; base = RGB(120, 118, 122); }
     if (t == T_WATER || t == T_PIER) { tex = TX_DIRT; base = RGB(60, 58, 56); }
     if (ty < 58 && t == T_GRASS) base = RGB(100 + (int)(h % 8), 104 + (int)(h % 8), 90);   /* erba piu' secca in collina */
+    if (tex == TX_GRASS || (tex == TX_DIRT && t != T_WATER && t != T_PIER)) {
+        /* erba e terra sfumano l'una nell'altra: niente bordi quadrati tra una casella e l'altra */
+        float w0 = grass_w(tx, ty), w1 = grass_w(tx + 1, ty), w2 = grass_w(tx + 1, ty + 1), w3 = grass_w(tx, ty + 1);
+        uint32_t gb = (ty < 58) ? RGB(100 + (int)(h % 8), 104 + (int)(h % 8), 90) : RGB(104 + (int)(h % 8), 112 + (int)(h % 8), 92 + (int)(h % 6));
+        uint32_t db = RGB(130, 118, 104);
+        if (w0 > 0.99f && w1 > 0.99f && w2 > 0.99f && w3 > 0.99f)
+            emit_quad(v3(x0, h0, z0), v3(x0 + TS, h1, z0), v3(x0 + TS, h2, z0 + TS), v3(x0, h3, z0 + TS),
+                      litv(gb, l0, s0), litv(gb, l1, s1), litv(gb, l2, s2), litv(gb, l3, s3),
+                      x0 / ts, z0 / ts, (x0 + TS) / ts, z0 / ts, (x0 + TS) / ts, (z0 + TS) / ts, x0 / ts, (z0 + TS) / ts, TX_GRASS, RB_OPAQUE);
+        else {
+            emit_quad(v3(x0, h0, z0), v3(x0 + TS, h1, z0), v3(x0 + TS, h2, z0 + TS), v3(x0, h3, z0 + TS),
+                      litv(db, l0, s0), litv(db, l1, s1), litv(db, l2, s2), litv(db, l3, s3),
+                      x0 / ts, z0 / ts, (x0 + TS) / ts, z0 / ts, (x0 + TS) / ts, (z0 + TS) / ts, x0 / ts, (z0 + TS) / ts, TX_DIRT, RB_OPAQUE);
+            if (w0 + w1 + w2 + w3 > 0.01f)
+                emit_quad(v3(x0, h0 + 0.06f, z0), v3(x0 + TS, h1 + 0.06f, z0), v3(x0 + TS, h2 + 0.06f, z0 + TS), v3(x0, h3 + 0.06f, z0 + TS),
+                          rgba(litv(gb, l0, s0), (int)(w0 * 255)), rgba(litv(gb, l1, s1), (int)(w1 * 255)),
+                          rgba(litv(gb, l2, s2), (int)(w2 * 255)), rgba(litv(gb, l3, s3), (int)(w3 * 255)),
+                          x0 / ts, z0 / ts, (x0 + TS) / ts, z0 / ts, (x0 + TS) / ts, (z0 + TS) / ts, x0 / ts, (z0 + TS) / ts, TX_GRASS, RB_ALPHA);
+        }
+    } else
     emit_quad(v3(x0, h0, z0), v3(x0 + TS, h1, z0), v3(x0 + TS, h2, z0 + TS), v3(x0, h3, z0 + TS),
               litv(base, l0, s0), litv(base, l1, s1), litv(base, l2, s2), litv(base, l3, s3),
               x0 / ts, z0 / ts, (x0 + TS) / ts, z0 / ts, (x0 + TS) / ts, (z0 + TS) / ts, x0 / ts, (z0 + TS) / ts, tex, RB_OPAQUE);
@@ -3437,13 +3775,22 @@ static void draw_outdoor(int tx, int ty, int t, unsigned h)
         if (h1 > mx) mx = h1; if (h2 > mx) mx = h2; if (h3 > mx) mx = h3;
         if (h1 < mn) mn = h1; if (h2 < mn) mn = h2; if (h3 < mn) mn = h3;
         cur_gy = 0;
-        TEXS(TX_ROCK, 18);
-        box(cx, mn - 3, cz, 8.4f, (mx - mn) + 6 + (h % 5), 8.4f, (h % 5) * 0.08f, RGB(112, 110, 116), RGB(96, 104, 92), 1, 0);
-        if (h % 3 == 0) box(cx + 3, mx + 2, cz - 2, 4, 4 + (h % 4), 3.5f, h * 0.2f, RGB(106, 104, 110), RGB(96, 104, 92), 1, 0);
+        TEXS(TX_ROCK, 12);
+        if (dcam > 130) {
+            box(cx, mn - 3, cz, 8.4f, (mx - mn) + 6 + (h % 5), 8.4f, (h % 5) * 0.08f, RGB(112, 110, 116), RGB(96, 104, 92), 1, 0);
+        } else {
+            /* sperone di roccia irregolare invece di un blocco squadrato */
+            float hh = (mx - mn) + 6 + (h % 5);
+            pb_x = cx; pb_z = cz; pb_c = cosf(h * 0.37f); pb_s = sinf(h * 0.37f); pb_rolling = 0; pb_y = mn - 3;
+            lo_detail = dcam > 75;
+            rockL(0, hh * 0.45f, 0, 10.5f, hh * 0.6f + 2, 10.0f, h, RGB(112, 110, 116), 5, 9);
+            if (h % 3 == 0) rockL(3, hh + 1, -2, 4.5f, 3.5f + (h % 4), 4.0f, h * 3 + 5, RGB(106, 104, 110), 4, 7);
+            lo_detail = 0;
+        }
         break;
     }
     case T_PINE:
-        if (dcam > 26) draw_pine(cx + (h % 5) - 2.0f, cz + ((h >> 4) % 5) - 2.0f, h);
+        if (dcam > 32) draw_pine(cx + (h % 5) - 2.0f, cz + ((h >> 4) % 5) - 2.0f, h);
         break;
     case T_BOULDER: draw_boulder(cx, cz, h); break;
     case T_RUIN: draw_ruin(tx, ty, h); break;
@@ -3649,14 +3996,15 @@ static void arc_pose(int atk, float tm, float sf, float su, float *h, float *d)
     if (atk == AT_HEAVY && ta > 0.7f) { d[1] -= 0.4f; }
 }
 /* rotazione del corpo nel colpo circolare */
-static float spin_angle(void)
+static float spin_at(float tm)
 {
     int W = AW[AT_L3], A = AA[AT_L3];
     float ta;
-    if (P.state != PS_ATK || P.atk != AT_L3 || P.timer <= W) return 0;
-    ta = P.timer >= W + A ? 1 : (float)(P.timer - W) / A;
+    if (P.state != PS_ATK || P.atk != AT_L3 || tm <= W) return 0;
+    ta = tm >= W + A ? 1 : (tm - W) / A;
     return -2 * PI * ease_out3(ta);
 }
+static float spin_angle(void) { return spin_at((float)P.timer); }
 static V3 trB[18], trT[18];
 static void draw_player(void)
 {
@@ -3693,6 +4041,12 @@ static void draw_player(void)
         float gh0 = ground_h(x, z);
         cur_gy = gh0; shadow(x, z, 6); cur_gy = 0;
         pb_y = gh0;
+        if (P.state == PS_ROLL) {
+            /* in pendenza la capriola segue il terreno piu' alto sotto il corpo, cosi' non ci affonda */
+            float g1 = ground_h(x + P.rx * 4, z + P.ry * 4), g2 = ground_h(x - P.rx * 4, z - P.ry * 4);
+            float gm = g1 > g2 ? g1 : g2;
+            if (gm > pb_y) pb_y += (gm - pb_y) * 0.7f;
+        }
     }
     pb_x = x; pb_z = z; pb_rolling = 0;
     if (P.state == PS_ROLL) {
@@ -3704,13 +4058,16 @@ static void draw_player(void)
             pb_c = cosf(ang); pb_s = sinf(ang);
             pb_y += sinf(t * PI) * 2.2f;
         } else {
-            float t = (P.timer - 2) / 15.0f;
-            if (t < 0) t = 0;
-            if (t > 1) t = 1;
-            t = t * t * (3 - 2 * t);               /* rotazione morbida: lenta-veloce-lenta */
-            pb_rolling = 1;
-            pb_roll = t * 2 * PI;
-            pb_y += -sinf(t * PI) * 2.8f;
+            /* tuffo (0-2), rotazione (2-15), rialzata (15-22) */
+            float t = (P.timer - 2) / 13.0f;
+            if (P.timer >= 2 && P.timer < 15) {
+                float tt = t * (0.6f + 0.4f * t * (3 - 2 * t));   /* parte svelta, chiude morbida */
+                pb_rolling = 1;
+                pb_roll = tt * 2 * PI;
+                pb_rollC = 1 - 0.55f * sinf(t * PI) * (t < 0.15f ? t / 0.15f + 0.0f : 1);
+                if (pb_rollC > 1) pb_rollC = 1;
+                pb_rollF = 1.5f;
+            }
         }
     } else {
         float sp = spin_angle();
@@ -3760,6 +4117,20 @@ static void draw_player(void)
         }
         if (P.state == PS_HURT) { tLean = -1.2f; tHip = 9.6f; }
         if (P.state == PS_ROLL && P.backstep) { tLean = -0.8f; tLeg[0] = 0.3f; tLeg[1] = -0.5f; tKnee[0] = tKnee[1] = 0.6f; }
+        if (P.state == PS_ROLL && !P.backstep) {
+            if (P.timer < 2) {          /* tuffo: si abbassa e si sbilancia in avanti */
+                tHip = 8.6f; tLean = 2.0f; tLeg[0] = 0.6f; tLeg[1] = -0.3f; tKnee[0] = 1.2f; tKnee[1] = 0.8f;
+                tArm[0] = tArm[1] = 0.9f;
+            } else if (P.timer >= 15) { /* rialzata: atterra accovacciato e si raddrizza con lo slancio */
+                float r = (P.timer - 15) / 7.0f;
+                if (r > 1) r = 1;
+                r = r * r * (3 - 2 * r);
+                tHip = 7.8f + 3.2f * r; tLean = 1.6f - 1.3f * r;
+                tLeg[0] = 0.75f - 0.6f * r; tLeg[1] = -0.35f + 0.3f * r;
+                tKnee[0] = 1.5f - 1.3f * r; tKnee[1] = 1.1f - 0.9f * r;
+                tArm[0] = 0.6f - 0.5f * r; tArm[1] = 0.7f - 0.6f * r;
+            }
+        }
         if (P.state == PS_HEAL) tLean = 0.2f;
         /* sfumatura: le pose si raggiungono in pochi frame invece di scattare */
         k = (P.state == PS_ATK || P.state == PS_ROLL) ? 0.55f : (P.state == PS_FREE ? 0.5f : 0.3f);
@@ -3815,7 +4186,7 @@ static void draw_player(void)
             pb_tw = sTw; pb_sway = sSw; pb_tilt = sTl;
         }
     }
-    if (pb_rolling) { legA[0] = legA[1] = 1.2f; kneeB[0] = kneeB[1] = 2.0f; lean = 1.5f; }
+    if (pb_rolling) { legA[0] = 1.65f; legA[1] = 1.45f; kneeB[0] = 2.7f; kneeB[1] = 2.5f; lean = 2.6f; armA[0] = armA[1] = 1.3f; hipU = 10.5f; }
     pb_body = !pb_rolling; pb_hipU = hipU; pb_shU = shU; pb_wover = -9;
 
     /* ---- gambe: anca, ginocchio, caviglia, piede (i: 0 = destra, 1 = sinistra) ---- */
@@ -3828,14 +4199,14 @@ static void draw_player(void)
         /* cosciale, ginocchiello a punta, schiniere, scarpa a lame */
         mat_metal = 1;
         TEXS(TX_METAL, 8);
-        limb_taper = 0.82f;
+        limb_taper = 0.82f; limb_bulge = 0.14f;
         limbL(0, hipU, side, kf, ku + 0.3f, side, 1.12f, 1.2f, steel);
-        limb_taper = 1.0f;
+        limb_taper = 1.0f; limb_bulge = 0;
         blobL(kf + 0.25f, ku, side, 1.05f, 1.0f, 0.95f, steelD, 4, 7);
         limbL(kf + 0.4f, ku + 0.3f, side, kf + 1.35f, ku, side, 0.35f, 0.35f, bronze);
-        limb_taper = 0.85f;
+        limb_taper = 0.8f; limb_bulge = 0.16f;
         limbL(kf, ku - 0.4f, side, af, au + 0.4f, side, 0.95f, 1.0f, steel);
-        limb_taper = 1.0f;
+        limb_taper = 1.0f; limb_bulge = 0;
         blobL(af + 0.75f, au - 0.1f, side, 1.6f, 0.62f, 0.82f, steelD, 4, 8);
         limbL(af - 0.2f, au + 0.2f, side, af + 0.6f, au + 0.5f, side, 0.85f, 0.9f, steelD);
         mat_metal = 0;
@@ -3848,9 +4219,9 @@ static void draw_player(void)
     limb_taper = 1.0f;
     mat_metal = 1;
     TEXS(TX_METAL, 10);
-    limb_taper = 1.3f;
+    limb_taper = 1.3f; limb_bulge = 0.08f;
     limbL(0, hipU + 0.4f, 0, lean * 0.6f, shU - 2.4f + breath, 0, 1.75f, 1.3f, steelD);          /* vita stretta, torace largo */
-    limb_taper = 1.0f;
+    limb_taper = 1.0f; limb_bulge = 0;
     blobL(lean * 0.7f + 0.35f, shU - 1.5f + breath, 0, 1.8f, 2.3f, 2.9f, steel, 6, 10);           /* petto */
     blobL(lean * 0.7f + 1.1f, shU - 1.0f + breath, 0.95f, 1.1f, 1.3f, 1.2f, steel, 4, 8);         /* placche pettorali */
     blobL(lean * 0.7f + 1.1f, shU - 1.0f + breath, -0.95f, 1.1f, 1.3f, 1.2f, steel, 4, 8);
@@ -3894,7 +4265,7 @@ static void draw_player(void)
     blobL(lean * 0.7f - 0.5f, shU - 1.4f + breath, 0, 1.5f, 2.3f, 2.75f, steel, 5, 10);     /* schienale */
     limbL(lean * 0.7f - 1.85f, shU - 3.6f + breath, 0, lean * 0.75f - 1.9f, shU + 0.3f + breath, 0, 0.22f, 0.18f, bronze);
     mat_metal = 0;
-    TEXS(TX_CLOTH, 8);
+    TEXS(TX_CLOTH, 1);
     cloth_cape(shU + breath, lean, sway, cape);
     /* spallacci a lame sovrapposte */
     mat_metal = 1;
@@ -3949,13 +4320,13 @@ static void draw_player(void)
         }
         mat_metal = 1;
         TEXS(TX_METAL, 8);
-        limb_taper = 0.88f;
+        limb_taper = 0.88f; limb_bulge = 0.12f;
         limbL(sf, su, ss, ef, eu, es, 0.85f, 0.85f, steel);
-        limb_taper = 1.0f;
+        limb_taper = 1.0f; limb_bulge = 0;
         blobL(ef, eu, es, 0.85f, 0.85f, 0.85f, steelD, 4, 7);
-        limb_taper = 0.85f;
+        limb_taper = 0.8f; limb_bulge = 0.12f;
         limbL(ef, eu, es, hf2, hu2, hs2, 0.78f, 0.78f, steel);
-        limb_taper = 1.0f;
+        limb_taper = 1.0f; limb_bulge = 0;
         blobL(hf2 + 0.15f, hu2 - 0.45f, hs2, 0.68f, 0.82f, 0.55f, steelD, 4, 7);
         mat_metal = 0;
         if (P.state == PS_HEAL) {
@@ -3997,6 +4368,10 @@ static void draw_player(void)
             float hh[3], dd[3];
             arc_pose(P.atk, (float)P.timer, sf, su, hh, dd);
             thf = hh[0]; thu = hh[1]; ths = hh[2]; tsF = dd[0]; tsU = dd[1]; tsS = dd[2];
+        } else if (P.state == PS_ROLL && !P.backstep) {
+            /* nella capriola la spada resta stretta al corpo, lungo la schiena */
+            thf = sf + 1.4f; thu = su - 3.2f; ths = ss * 0.55f;
+            tsF = -0.85f; tsU = 0.45f; tsS = 0.1f;
         } else if (P.sprint) {
             /* in corsa la lama resta bassa e indietro */
             float sw = armA[0];
@@ -4009,7 +4384,7 @@ static void draw_player(void)
             tsF = 0.88f; tsU = -0.22f; tsS = 0.42f;
         }
         /* sfumatura: fuori dai colpi la lama torna morbidamente in guardia */
-        kk = attacking ? (P.timer > W - 3 && P.timer <= W + A + 1 ? 1.0f : 0.6f) : 0.3f;
+        kk = attacking ? (P.timer > W - 3 && P.timer <= W + A + 1 ? 1.0f : 0.6f) : (P.state == PS_ROLL ? 0.6f : 0.3f);
         if (sHu == 0) { sHf = thf; sHu = thu; sHs = ths; }
         sHf += (thf - sHf) * kk; sHu += (thu - sHu) * kk; sHs += (ths - sHs) * kk;
         sSwF += (tsF - sSwF) * kk; sSwU += (tsU - sSwU) * kk; sSwS += (tsS - sSwS) * kk;
@@ -4017,13 +4392,13 @@ static void draw_player(void)
         ef = (sf + hf) * 0.5f - 0.2f; eu = (su + hu) * 0.5f - 0.9f; es = (ss + hs) * 0.5f + 0.7f;
         mat_metal = 1;
         TEXS(TX_METAL, 8);
-        limb_taper = 0.88f;
+        limb_taper = 0.88f; limb_bulge = 0.12f;
         limbL(sf, su, ss, ef, eu, es, 0.85f, 0.85f, steel);
-        limb_taper = 1.0f;
+        limb_taper = 1.0f; limb_bulge = 0;
         blobL(ef, eu, es, 0.85f, 0.85f, 0.85f, steelD, 4, 7);
-        limb_taper = 0.85f;
+        limb_taper = 0.8f; limb_bulge = 0.12f;
         limbL(ef, eu, es, hf, hu, hs, 0.78f, 0.78f, steel);
-        limb_taper = 1.0f;
+        limb_taper = 1.0f; limb_bulge = 0;
         mat_metal = 0;
         {
             float l = sqrtf(swF * swF + swU * swU + swS * swS);
@@ -4059,12 +4434,14 @@ static void draw_player(void)
                         V3 tb, tt;
                         if (sub == 0) { tb = bas; tt = tip; }
                         else {
-                            float hh[3], dd[3], dl;
+                            float hh[3], dd[3], dl, sc = pb_c, ss2 = pb_s;
+                            if (P.atk == AT_L3) { float sp = spin_at(P.timer - sub / 3.0f); pb_c = cosf(ang + sp); pb_s = sinf(ang + sp); }
                             arc_pose(P.atk, P.timer - sub / 3.0f, sf, su, hh, dd);
                             dl = sqrtf(dd[0] * dd[0] + dd[1] * dd[1] + dd[2] * dd[2]) + 0.0001f;
                             dd[0] /= dl; dd[1] /= dl; dd[2] /= dl;
                             tt = L2W(hh[0] + dd[0] * (bl + 0.8f), hh[1] + dd[1] * (bl + 0.8f), hh[2] + dd[2] * (bl + 0.8f));
                             tb = L2W(hh[0] + dd[0] * (bl * 0.55f + 0.8f), hh[1] + dd[1] * (bl * 0.55f + 0.8f), hh[2] + dd[2] * (bl * 0.55f + 0.8f));
+                            pb_c = sc; pb_s = ss2;
                         }
                         if (trN < TRMAX) trN++;
                         for (k2 = trN - 1; k2 > 0; k2--) { trB[k2] = trB[k2 - 1]; trT[k2] = trT[k2 - 1]; }
@@ -4133,15 +4510,15 @@ static void draw_player(void)
         int k2;
         float scroll = frame * 0.09f;
         for (k2 = 0; k2 < trN - 1; k2++) {
-            float f0 = 1.0f - (float)k2 / trN, f1 = 1.0f - (float)(k2 + 1) / trN;
+            float f0 = (1.0f - (float)k2 / trN) * 0.8f, f1 = (1.0f - (float)(k2 + 1) / trN) * 0.8f;
             V3 b0, t0, b1, t1;
             uint32_t c0, c1;
             float dx0 = trT[k2].x - trB[k2].x, dy0 = trT[k2].y - trB[k2].y, dz0 = trT[k2].z - trB[k2].z;
             float dx1 = trT[k2 + 1].x - trB[k2 + 1].x, dy1 = trT[k2 + 1].y - trB[k2 + 1].y, dz1 = trT[k2 + 1].z - trB[k2 + 1].z;
-            float w0 = 0.3f + 0.45f * (1 - f0), w1 = 0.3f + 0.45f * (1 - f1);   /* la fiamma si allarga mentre si spegne */
-            b0 = v3(trB[k2].x - dx0 * 0.6f, trB[k2].y - dy0 * 0.6f, trB[k2].z - dz0 * 0.6f);
+            float w0 = 0.12f + 0.3f * (1 - f0), w1 = 0.12f + 0.3f * (1 - f1);   /* la fiamma si allarga mentre si spegne */
+            b0 = v3(trB[k2].x - dx0 * 0.15f, trB[k2].y - dy0 * 0.15f, trB[k2].z - dz0 * 0.15f);
             t0 = v3(trT[k2].x + dx0 * w0, trT[k2].y + dy0 * w0, trT[k2].z + dz0 * w0);
-            b1 = v3(trB[k2 + 1].x - dx1 * 0.6f, trB[k2 + 1].y - dy1 * 0.6f, trB[k2 + 1].z - dz1 * 0.6f);
+            b1 = v3(trB[k2 + 1].x - dx1 * 0.15f, trB[k2 + 1].y - dy1 * 0.15f, trB[k2 + 1].z - dz1 * 0.15f);
             t1 = v3(trT[k2 + 1].x + dx1 * w1, trT[k2 + 1].y + dy1 * w1, trT[k2 + 1].z + dz1 * w1);
             c0 = f0 > 0.75f ? rgba(RGB(255, 235, 170), (int)(255 * f0)) : (f0 > 0.4f ? rgba(RGB(255, 150, 50), (int)(255 * f0)) : rgba(RGB(200, 50, 15), (int)(320 * f0)));
             c1 = f1 > 0.75f ? rgba(RGB(255, 235, 170), (int)(255 * f1)) : (f1 > 0.4f ? rgba(RGB(255, 150, 50), (int)(255 * f1)) : rgba(RGB(200, 50, 15), (int)(320 * f1)));
@@ -4300,9 +4677,10 @@ static void draw_enemy(Enemy *e)
     gh = ground_h(x, z);
     cur_gy = gh;
     lo_detail = dxp * dxp + dzp * dzp > 100 * 100;
+    caps_near = dxp * dxp + dzp * dzp < 70 * 70;
     if (e->kind >= 2) {
         if (e->state == ES_DEAD) {
-            float t = e->deadT / 40.0f;
+            float t = e->deadT / 60.0f;
             TEXS(TX_ROCK, 8);
             box(x, 0, z, k->r * (1.6f - t * 0.6f), 3 * t + 1, k->r * 0.8f, ang, RGB(90, 86, 84), RGB(90, 86, 84), 1, 0);
             TEXS(TX_WHITE, 32); cur_gy = 0;
@@ -4317,8 +4695,8 @@ static void draw_enemy(Enemy *e)
         return;
     }
     body = e->kind ? RGB(130, 138, 154) : RGB(120, 102, 88);
-    if (e->state == ES_DEAD) {
-        float t = e->deadT / 40.0f;
+    if (e->state == ES_DEAD && e->deadT <= 38) {
+        float t = e->deadT / 38.0f;
         /* il corpo si sgretola in un cumulo di cenere con braci che si spengono */
         cur_gy = 0;
         pb_x = x; pb_z = z; pb_c = c; pb_s = s; pb_rolling = 0; pb_y = gh;
@@ -4344,7 +4722,9 @@ static void draw_enemy(Enemy *e)
         int moving = e->state == ES_CHASE, far = dxp * dxp + dzp * dzp > 120 * 120, i;
         float ph = frame * 0.32f + x * 0.13f, amp = moving ? 1.0f : 0.12f;
         float wind = e->state == ES_WIND ? 1.0f : 0, strike = e->state == ES_STRIKE ? 1.0f : 0;
-        pb_x = x; pb_z = z; pb_c = c; pb_s = s; pb_rolling = 0; pb_y = gh;
+        pb_x = x; pb_z = z; pb_c = c; pb_s = s; pb_rolling = 0; pb_y = gh + e->az;
+        if (e->tilt < -0.02f) { pb_rolling = 1; pb_roll = e->tilt; pb_rollC = 1; pb_rollF = 0; }
+        if (e->state == ES_DEAD) { wind = strike = 0; amp = 0; }
         if (e->kind == 0) {
             /* --- Reietto: figura scarna e curva, stracci, mannaia arrugginita --- */
             float hip = 7.4f + fabsf(sinf(ph)) * 0.4f * amp, hunch = 1.8f + wind * 0.8f - strike * 0.6f;
@@ -4478,9 +4858,10 @@ static void draw_enemy(Enemy *e)
             }
         }
     }
+    pb_rolling = 0;
     cur_gy = gh;
     TEXS(TX_WHITE, 32);
-    if (e->hp < k->hp) hpbar3d(x, z, e->kind ? 29.0f : 20.0f, (float)e->hp / k->hp, 8);
+    if (e->hp < k->hp && e->state != ES_DEAD) hpbar3d(x, z, e->kind ? 29.0f : 20.0f, (float)e->hp / k->hp, 8);
     cur_gy = 0;
 }
 
@@ -4807,6 +5188,17 @@ static void draw_hud(void)
 {
     char b[48], n[12];
     int i, w;
+    if (flashT > 6) r_rect(0, 0, SW, SH, rgba(RGB(220, 230, 255), (flashT - 6) * 30));
+    if (comboN >= 2) {
+        /* contatore dei colpi */
+        const char *rt = comboN >= 35 ? "INARRESTABILE!" : comboN >= 20 ? "BRUTALE!" : comboN >= 10 ? "FEROCE!" : 0;
+        int pulse = comboT > 104 ? 1 : 0, a = comboT < 30 ? comboT * 8 : 240;
+        itoa_s(comboN, n);
+        w = text_w(n, 3 + pulse);
+        text(SW - 26 - w, 108 - pulse * 3, 3 + pulse, rgba(RGB(240, 225, 190), a), n);
+        text(SW - 26 - text_w("COLPI", 1), 132, 1, rgba(RGB(220, 200, 160), a), "COLPI");
+        if (rt) text(SW - 26 - text_w(rt, 1), 144, 1, rgba(RGB(255, 140, 60), a), rt);
+    }
     /* emblema */
     diamond(18, 18, 12, GOLD, rgba(RGB(20, 16, 18), 200));
     diamond(18, 18, 8, GOLDD, 0);
@@ -5240,7 +5632,7 @@ void game_render(void)
     if (shake > 0) { tx += (float)((int)(rnd() % 5) - 2); tz += (float)((int)(rnd() % 5) - 2); }
     {
         /* telecamera alle spalle con collisione contro gli edifici */
-        float want = 62.0f, t, dist, cp = cosf(camPitch), sp = sinf(camPitch);
+        float want = 62.0f + 16.0f * cmbAmt, t, dist, cp = cosf(camPitch + 0.12f * cmbAmt), sp = sinf(camPitch + 0.12f * cmbAmt);
 #ifdef GAME_DEBUG
         if (dbg_cam > 0) want = dbg_cam;
 #endif
@@ -5274,7 +5666,16 @@ void game_render(void)
         if (camU.y < 0) camU = v3(-camU.x, -camU.y, -camU.z);
     }
     camEye = eye;
-    r_begin(endingSeen ? RGB(96, 80, 84) : FOGC, eye, tgt, 70, 270, endingSeen ? RGB(96, 80, 84) : FOGC);
+    {
+        /* nebbia: col temporale vira al grigio-verde; il lampo la schiarisce per un attimo */
+        uint32_t fc = FOGC;
+        if (!endingSeen) {
+            float rk = rainAmt * 0.7f, fl = flashT > 0 ? (flashT > 7 ? 1.0f : flashT / 10.0f) : 0;
+            int r = (int)(26 + (58 - 26) * rk + 120 * fl), g = (int)(30 + (66 - 30) * rk + 125 * fl), b = (int)(42 + (64 - 42) * rk + 130 * fl);
+            fc = RGB(r > 255 ? 255 : r, g > 255 ? 255 : g, b > 255 ? 255 : b);
+        } else fc = RGB(96, 80, 84);
+        r_begin(fc, eye, tgt, 70 - 20 * rainAmt, 270 - 50 * rainAmt, fc);
+    }
 
     {   /* luna velata nel cielo (additiva: la nebbia non la copre) */
         float ma = -0.9f, mx = eye.x + cosf(ma) * 320, mz = eye.z + sinf(ma) * 320, my = eye.y + 170;
@@ -5322,9 +5723,11 @@ void game_render(void)
     }
     rim_on = 1;
     for (i = 0; i < NE; i++) if (E[i].alive) draw_enemy(&E[i]);
-    lo_detail = 0;
+    lo_detail = 0; caps_near = 0;
+    caps_near = 1;
     if (Bs.state != BS_OFF || !Bs.dead) draw_boss();
     rb_draw();
+    caps_near = 0;
     draw_npc();
     draw_player();
     rim_on = 0;
@@ -5360,8 +5763,36 @@ void game_render(void)
         float k = shockT / 16.0f, r0 = (1 - k) * 34, gh2 = ground_h(shockX, shockY);
         cur_gy = gh2;
         fan(shockX, shockY, 0.8f, r0, r0 + 3 + 3 * k, 0, 2 * PI, rgba(RGB(255, 170, 90), (int)(200 * k)), 20);
-        ground_spot(shockX, shockY, 22 + (1 - k) * 18, 1, rgba(RGB(255, 120, 40), (int)(150 * k)), RB_ADD);
+        glow(shockX, 3, shockY, 14 + (1 - k) * 10, rgba(RGB(255, 120, 40), (int)(150 * k)));
         cur_gy = 0;
+    }
+    /* nuvole di sangue che si allargano e svaniscono */
+    for (i = 0; i < 10; i++)
+        if (puf[i].t > 0) {
+            float k = puf[i].t / 18.0f, sz = puf[i].s * (1.7f - k);
+            cur_gy = ground_h(puf[i].x, puf[i].y);
+            splat(puf[i].x, puf[i].h + (1 - k) * 1.5f, puf[i].y, sz, rgba(RGB(105, 6, 12), (int)(210 * k)));
+            splat(puf[i].x + 2, puf[i].h + 1.5f, puf[i].y - 1, sz * 0.6f, rgba(RGB(140, 10, 16), (int)(170 * k)));
+            cur_gy = 0;
+        }
+    /* pioggia: gocce allungate attorno alla telecamera e schizzi a terra */
+    if (rainAmt > 0.02f) {
+        int nd = (int)(90 * rainAmt);
+        float cx = tgt.x, cz = tgt.z, gyc = ground_h(P.x, P.y);
+        cur_gy = 0;
+        for (i = 0; i < nd; i++) {
+            float hx = (float)(hash2(i, 31) % 1400) / 10.0f, hz = (float)(hash2(i, 37) % 1400) / 10.0f;
+            float px = cx + fmodf(hx - cx + 7000.0f, 140.0f) - 70, pz = cz + fmodf(hz - cz + 7000.0f, 140.0f) - 70;
+            float fall = fmodf(frame * 5.5f + (hash2(i, 41) % 100), 100.0f), py = gyc + 90 - fall;
+            V3 a, b, c2, d2;
+            if (py < gyc + 1) continue;
+            a = v3(px - camR.x * 0.12f, py, pz - camR.z * 0.12f);
+            b = v3(px + camR.x * 0.12f, py, pz + camR.z * 0.12f);
+            c2 = v3(px + 0.6f + camR.x * 0.12f, py + 7, pz + 0.3f + camR.z * 0.12f);
+            d2 = v3(px + 0.6f - camR.x * 0.12f, py + 7, pz + 0.3f - camR.z * 0.12f);
+            emit_quad(a, b, c2, d2, rgba(RGB(170, 185, 200), 110), rgba(RGB(170, 185, 200), 110), 0, 0, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, TX_WHITE, RB_ADD);
+            if (fall > 88) glow(px, gyc + 0.6f, pz, 1.0f, rgba(RGB(160, 175, 190), 90));
+        }
     }
     /* lampo d'impatto: stella di raggi additivi rivolta alla camera */
     for (i = 0; i < 6; i++)
