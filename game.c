@@ -64,11 +64,11 @@ typedef struct {
 } EKind;
 static const EKind EK[4] = {
     /* Reietto: veloce e fragile */
-    { 70, 0.62f, 12.5f, 30, 18, 34, 60, 0, 3.9f },
+    { 70, 0.5f, 12.5f, 30, 18, 34, 60, 0, 3.9f },
     /* Lanciere: lento, lungo raggio, non si scompone con gli attacchi leggeri */
-    { 120, 0.48f, 19.0f, 42, 26, 40, 110, 1, 4.4f },
+    { 120, 0.4f, 19.0f, 42, 26, 40, 110, 1, 4.4f },
     /* Lupo cinereo: rapidissimo, balzo in avanti */
-    { 60, 0.95f, 11.5f, 22, 16, 26, 70, 0, 3.6f },
+    { 60, 0.8f, 11.5f, 22, 16, 26, 70, 0, 3.6f },
     /* Colosso di pietra: lento, colpi devastanti, non si scompone */
     { 320, 0.42f, 19.0f, 52, 42, 52, 450, 1, 6.0f },
 };
@@ -1225,7 +1225,7 @@ static void hurt_player(int dmg, float sx, float sy)
 /* ------------------------------------------------------------------ */
 enum { AT_L1, AT_HEAVY, AT_L2, AT_L3, AT_RUN };
 static const int AW[5] = { 7, 16, 6, 8, 7 }, AA[5] = { 6, 6, 6, 9, 7 }, AR[5] = { 12, 20, 12, 18, 16 };
-static const float ASTEP[5] = { 0.95f, 1.0f, 0.95f, 1.45f, 2.0f };    /* avanzamento durante il colpo */
+static const float ASTEP[5] = { 0.75f, 0.8f, 0.75f, 1.15f, 1.5f };    /* avanzamento durante il colpo */
 static const float ARANGE[5] = { 19, 23, 19, 20, 21 };
 static const float ADMG[5] = { 1.0f, 1.0f, 1.05f, 1.45f, 1.3f };
 static const int ACOST[5] = { 15, 30, 14, 20, 22 };
@@ -1444,12 +1444,12 @@ static void player_update(const Input *in)
     switch (P.state) {
     case PS_FREE: {
         /* movimento con accelerazione e frenata morbide */
-        float sp = P.sprint ? 1.6f : 1.0f, k = ml > 0 ? 0.24f : 0.2f;
+        float sp = P.sprint ? 0.95f : 0.58f, k = ml > 0 ? 0.2f : 0.18f;
         float tvx = mx * sp * ml, tvy = my * sp * ml;
         P.vx += (tvx - P.vx) * k; P.vy += (tvy - P.vy) * k;
         if (fabsf(P.vx) + fabsf(P.vy) > 0.02f) {
             move_circle(&P.x, &P.y, 3.5f, P.vx, P.vy);
-            P.walk += sqrtf(P.vx * P.vx + P.vy * P.vy) * 0.3f;
+            P.walk += sqrtf(P.vx * P.vx + P.vy * P.vy) * 0.36f;
         }
         if (ml > 0 && (!locked || P.sprint)) turn_towards(mx, my, P.sprint ? 0.22f : 0.3f);
         if (P.sprint && frame % 6 == 0) spawn_parts(P.x - P.fx * 4, P.y - P.fy * 4, 2, RGB(120, 112, 104), 0.5f);
@@ -1504,7 +1504,7 @@ static void player_update(const Input *in)
          * Senza direzione: saltello all'indietro, piu' breve */
         int dur = P.backstep ? 13 : 22;
         float t = (float)P.timer / dur, s;
-        s = P.backstep ? 1.9f * (1 - t) : (t < 0.1f ? 2.5f : (t < 0.68f ? 2.3f * (1 - (t - 0.1f) * 0.9f) : 1.3f * (1 - t) / 0.32f));
+        s = P.backstep ? 1.5f * (1 - t) : (t < 0.1f ? 1.95f : (t < 0.68f ? 1.8f * (1 - (t - 0.1f) * 0.9f) : 1.0f * (1 - t) / 0.32f));
         P.timer++;
         if (P.timer == 2) P.iframes = P.backstep ? 7 : 13;
         move_circle(&P.x, &P.y, 3.5f, P.rx * s, P.ry * s);
@@ -2852,7 +2852,7 @@ static V3 camR, camU;   /* assi della telecamera per i billboard */
 static float cur_gy;    /* quota del suolo per l'oggetto che si sta disegnando */
 static V3 camEye;
 static float camFx = 1, camFz;       /* direzione orizzontale della telecamera */
-int perf_lvl;                        /* 0 = qualita' piena, 1-2 = alleggerita (si regola da sola) */
+int perf_lvl = 1;                    /* 0 = qualita' piena, 1-2 = alleggerita (si regola da sola) */
 static int cur_fps;
 void game_set_fps(int fps) { cur_fps = fps; }
 /* e' visibile? scarta quello che sta dietro la telecamera, fuori dall'inquadratura o oltre la nebbia */
@@ -3169,6 +3169,7 @@ static float soft_shade(float nx, float ny, float nz)
     return 0.4f + 0.55f * (dl > 0 ? dl : 0) + 0.12f * (ny > 0 ? ny : 0) + 0.06f;
 }
 
+static float camVx, camVy = 0.4f, camVz = 0.9f, camHx, camHy = 0.8f, camHz = 0.6f;   /* direzione di vista e vettore a meta' strada, una volta per frame */
 /* luce di contorno fredda (stile moderno): i bordi in controluce si accendono di blu lunare */
 static int rim_on;
 static uint32_t rim_add(uint32_t c, float nx, float ny, float nz, V3 p)
@@ -3176,7 +3177,7 @@ static uint32_t rim_add(uint32_t c, float nx, float ny, float nz, V3 p)
     float vx, vy, vz, vl, rim;
     int r, g, b;
     if (!rim_on) return c;
-    vx = camEye.x - p.x; vy = camEye.y - p.y; vz = camEye.z - p.z; vl = sqrtf(vx * vx + vy * vy + vz * vz) + 0.001f;
+    vx = camVx; vy = camVy; vz = camVz; vl = 1; (void)p;
     rim = 1 - fabsf((nx * vx + ny * vy + nz * vz) / vl);
     rim = rim * rim * rim;
     r = (int)(c & 255) + (int)(rim * 55); g = (int)((c >> 8) & 255) + (int)(rim * 75); b = (int)((c >> 16) & 255) + (int)(rim * 120);
@@ -3189,9 +3190,10 @@ static uint32_t rim_add(uint32_t c, float nx, float ny, float nz, V3 p)
 /* colore di una superficie metallica: diffusa scura + riflesso speculare verso la telecamera */
 static uint32_t metal_col(uint32_t col, float nx, float ny, float nz, V3 p)
 {
-    float vx = camEye.x - p.x, vy = camEye.y - p.y, vz = camEye.z - p.z, vl = sqrtf(vx * vx + vy * vy + vz * vz) + 0.001f;
-    float hx = 0.33f + vx / vl, hy = 0.72f + vy / vl, hz = 0.6f + vz / vl, hl = sqrtf(hx * hx + hy * hy + hz * hz) + 0.001f;
-    float sp = (nx * hx + ny * hy + nz * hz) / hl, dl = nx * 0.33f + ny * 0.72f + nz * 0.6f, rim;
+    /* la direzione di vista e' la stessa per tutto il modello: niente radici quadrate per vertice */
+    float vx = camVx, vy = camVy, vz = camVz, vl = 1;
+    (void)p;
+    float sp = nx * camHx + ny * camHy + nz * camHz, dl = nx * 0.33f + ny * 0.72f + nz * 0.6f, rim;
     uint32_t c;
     int r, g, b, add;
     if (sp < 0) sp = 0;
@@ -3224,9 +3226,10 @@ static int caps_near;      /* nemici vicini: anche loro con forme arrotondate */
 static void limb(V3 a, V3 b, float w, float d, uint32_t col)
 {
     w *= pb_sc; d *= pb_sc;
+    if (perf_lvl && w + d < (perf_lvl >= 2 ? 0.22f : 0.12f)) return;      /* dettagli minuscoli: invisibili a 480x272 */
     float ax = b.x - a.x, ay = b.y - a.y, az = b.z - a.z, len = sqrtf(ax * ax + ay * ay + az * az) + 0.0001f;
     float rx = -pb_s, rz = pb_c, dp, sx, sy, sz, sl, fx, fy, fz, tp = limb_taper;
-    int seg = lo_detail ? 5 : (w + d > 1.5f) ? (hi_detail ? 12 : 9) : ((w + d > 0.6f) ? (hi_detail ? 9 : 7) : (hi_detail ? 5 : 4)), k, tex = cur_tex;
+    int seg = (lo_detail || perf_lvl >= 2) ? 5 : (w + d > 1.5f) ? (hi_detail ? 12 : 8) : ((w + d > 0.6f) ? (hi_detail ? 9 : 6) : (hi_detail ? 5 : 4)), k, tex = cur_tex;
     /* sul personaggio le parti grandi diventano "capsule": estremita' arrotondate e profilo bombato, niente tubi tagliati */
     int caps = (hi_detail || caps_near) && !lo_detail && w + d > 0.6f && tp > 0.6f, nr, r;
     float ts = cur_ts, vlen = ts > 0 ? len / ts : 1;
@@ -3301,6 +3304,7 @@ static void blobL(float cf, float cu, float cs, float rf, float ru, float rs, ui
     float ctab[21], stab[21];
     int r, k, tex = cur_tex;
     if (hi_detail) { segs = segs * 9 / 8; }
+    if (perf_lvl >= 2 && !lo_detail) { rings = rings > 4 ? rings - 1 : rings; segs = segs > 7 ? segs - 2 : segs; }
     if (lo_detail) { rings = rings > 4 ? rings / 2 + 1 : 3; segs = segs > 7 ? segs / 2 + 1 : 5; }
     if (rings > 16) rings = 16;
     if (segs > 20) segs = 20;
@@ -3928,13 +3932,13 @@ static void draw_outdoor(int tx, int ty, int t, unsigned h)
         if (h1 < mn) mn = h1; if (h2 < mn) mn = h2; if (h3 < mn) mn = h3;
         cur_gy = 0;
         TEXS(TX_ROCK, 12);
-        if (dcam > 130) {
+        if (dcam > (perf_lvl >= 2 ? 55 : (perf_lvl ? 90 : 130))) {
             box(cx, mn - 3, cz, 8.4f, (mx - mn) + 6 + (h % 5), 8.4f, (h % 5) * 0.08f, RGB(112, 110, 116), RGB(96, 104, 92), 1, 0);
         } else {
             /* sperone di roccia irregolare invece di un blocco squadrato */
             float hh = (mx - mn) + 6 + (h % 5);
             pb_x = cx; pb_z = cz; pb_c = cosf(h * 0.37f); pb_s = sinf(h * 0.37f); pb_rolling = 0; pb_y = mn - 3;
-            lo_detail = dcam > 75;
+            lo_detail = dcam > (perf_lvl ? 35 : 75);
             rockL(0, hh * 0.45f, 0, 10.5f, hh * 0.6f + 2, 10.0f, h, RGB(112, 110, 116), 5, 9);
             if (h % 3 == 0) rockL(3, hh + 1, -2, 4.5f, 3.5f + (h % 4), 4.0f, h * 3 + 5, RGB(106, 104, 110), 4, 7);
             lo_detail = 0;
@@ -3949,14 +3953,93 @@ static void draw_outdoor(int tx, int ty, int t, unsigned h)
     case T_TREE: case T_GRAVE: case T_LAMP: draw_prop(t, tx, ty, h); break;
     case T_WATER:
     case T_PIER: {
-        /* superficie del lago con riflessi */
-        Lt lw = light_point(cx, cz, 1);
-        uint32_t wc = rgba(litv(RGB(40, 56, 80), lw, 1), 210);
-        float sx = (float)((int)(hash2(tx, ty + frame / 24) % 10)) - 5;
+        /* superficie del lago: onde che si muovono, colore che cambia con la profondita' e con l'angolo di vista,
+         * schiuma lungo le rive, riflessi tremolanti della luna e delle luci */
+        int sub = dcam < (perf_lvl >= 2 ? 60 : 120) ? 2 : 1, i2, j2;
+        float t2 = frame * 0.03f, gx0 = (float)(tx + WX0) * TS, gz0 = (float)(ty + WY0) * TS;
+        float wv[3][3], csh[2][2];
+        V3 wp[3][3];
+        uint32_t wc[3][3];
         cur_gy = 0;
-        quad(v3(x0, WL, z0), v3(x0 + TS, WL, z0), v3(x0 + TS, WL, z0 + TS), v3(x0, WL, z0 + TS), wc);
-        if (hash2(tx * 7 + frame / 30, ty) % 6 == 0)
-            ground_spot(cx + sx, cz, 3.5f, WL + 0.1f, rgba(RGB(140, 160, 210), 60), RB_ADD);
+        for (j2 = 0; j2 < 2; j2++)
+            for (i2 = 0; i2 < 2; i2++) {
+                int cnt = 0, q;
+                for (q = 0; q < 4; q++) {
+                    int qx = tx + i2 - (q & 1), qz = ty + j2 - (q >> 1);
+                    if (qx >= 0 && qz >= 0 && qx < MW && qz < MH && (map[qz][qx] == T_WATER || map[qz][qx] == T_PIER)) cnt++;
+                }
+                csh[j2][i2] = 1 - cnt * 0.25f;
+            }
+        for (j2 = 0; j2 <= sub; j2++)
+            for (i2 = 0; i2 <= sub; i2++) {
+                float lx = x0 + TS * i2 / sub, lz = z0 + TS * j2 / sub, gx = gx0 + TS * i2 / sub, gz = gz0 + TS * j2 / sub;
+                float w = 0.35f * sinf(gx * 0.21f + t2 * 1.3f) + 0.25f * sinf(gz * 0.17f - t2 * 1.1f) + 0.15f * sinf((gx + gz) * 0.31f + t2 * 2.0f);
+                float sl = 0.35f * 0.21f * cosf(gx * 0.21f + t2 * 1.3f) + 0.15f * 0.31f * cosf((gx + gz) * 0.31f + t2 * 2.0f);
+                float ex2 = lx - camEye.x, ez2 = lz - camEye.z, dd = sqrtf(ex2 * ex2 + ez2 * ez2);
+                float fr = dd / 200.0f, shore, br;
+                int wn = (map[ty][tx] == T_WATER || map[ty][tx] == T_PIER);
+                Lt lw = light_point(lx, lz, 1);
+                int r, g, b, al;
+                /* riva: quanta acqua c'e' attorno al vertice, interpolata dagli angoli della casella */
+                {
+                    float u2 = (float)i2 / sub, v2 = (float)j2 / sub;
+                    shore = (csh[0][0] * (1 - u2) + csh[0][1] * u2) * (1 - v2) + (csh[1][0] * (1 - u2) + csh[1][1] * u2) * v2;
+                }
+                (void)wn;
+                if (fr < 0.25f) fr = 0.25f;
+                if (fr > 0.85f) fr = 0.85f;
+                br = 1 + sl * 6;
+                r = (int)((16 + (64 - 16) * fr + 26 * shore) * br); g = (int)((30 + (84 - 30) * fr + 30 * shore) * br); b = (int)((48 + (118 - 48) * fr + 14 * shore) * br);
+                if (r > 255) r = 255;
+                if (g > 255) g = 255;
+                if (b > 255) b = 255;
+                al = (int)(225 - 85 * shore);
+                wv[j2][i2] = w;
+                wp[j2][i2] = v3(lx, WL + w * 0.5f, lz);
+                wc[j2][i2] = rgba(litv(RGB(r, g, b), lw, 1.15f), al);
+            }
+        for (j2 = 0; j2 < sub; j2++)
+            for (i2 = 0; i2 < sub; i2++)
+                emit_quad(wp[j2][i2], wp[j2][i2 + 1], wp[j2 + 1][i2 + 1], wp[j2 + 1][i2], wc[j2][i2], wc[j2][i2 + 1], wc[j2 + 1][i2 + 1], wc[j2 + 1][i2],
+                          0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, TX_WHITE, RB_ALPHA);
+        /* schiuma lungo la riva */
+        if (dcam < 140) {
+            static const int ddx[4] = { 0, 0, 1, -1 }, ddy[4] = { 1, -1, 0, 0 };
+            int q;
+            for (q = 0; q < 4; q++) {
+                int nx = tx + ddx[q], ny = ty + ddy[q];
+                float ax3, az3, bx3, bz3, ix, iz, fa;
+                uint32_t fc;
+                if (nx < 0 || ny < 0 || nx >= MW || ny >= MH) continue;
+                if (map[ny][nx] == T_WATER || map[ny][nx] == T_PIER) continue;
+                if (ddx[q]) { ax3 = bx3 = x0 + (ddx[q] > 0 ? TS : 0); az3 = z0; bz3 = z0 + TS; ix = -ddx[q] * 2.6f; iz = 0; }
+                else { az3 = bz3 = z0 + (ddy[q] > 0 ? TS : 0); ax3 = x0; bx3 = x0 + TS; ix = 0; iz = -ddy[q] * 2.6f; }
+                fa = 0.55f + 0.45f * sinf(t2 * 2.2f + (gx0 + gz0) * 0.05f + q);
+                fc = rgba(lit(RGB(200, 210, 220), 1), (int)(70 + 70 * fa));
+                emit_quad(v3(ax3, WL + 0.45f, az3), v3(bx3, WL + 0.45f, bz3), v3(bx3 + ix * (0.7f + fa * 0.5f), WL + 0.4f, bz3 + iz * (0.7f + fa * 0.5f)), v3(ax3 + ix * (0.7f + fa * 0.5f), WL + 0.4f, az3 + iz * (0.7f + fa * 0.5f)),
+                          fc, fc, rgba(fc, 0), rgba(fc, 0), 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, TX_WHITE, RB_ALPHA);
+            }
+        }
+        /* riflessi: scintille che tremolano, piu' intense nella scia della luna; cerchi della pioggia */
+        if (dcam < 180 && perf_lvl < 2) {
+            float mdx = cosf(-0.9f), mdz = sinf(-0.9f), ex2 = cx - camEye.x, ez2 = cz - camEye.z, dl = sqrtf(ex2 * ex2 + ez2 * ez2) + 0.01f;
+            float al2 = (ex2 * mdx + ez2 * mdz) / dl;
+            int q;
+            for (q = 0; q < 2; q++) {
+                unsigned hq = hash2(tx * 3 + q, ty * 5 + (unsigned)(frame / 5));
+                float px = x0 + 2 + (hq % 12), pz = z0 + 2 + ((hq >> 6) % 12);
+                if (al2 > 0.93f) glow(px, WL + 0.6f, pz, 0.9f + (hq % 3) * 0.45f, rgba(RGB(190, 205, 240), 190));
+                else if (hq % 7 == 0) glow(px, WL + 0.6f, pz, 1.0f, rgba(RGB(120, 140, 180), 120));
+            }
+            if (rainAmt > 0.3f) {
+                unsigned hr = hash2(tx + (unsigned)(frame / 9) * 7, ty);
+                if (hr % 4 == 0) {
+                    float k3 = (frame % 9) / 9.0f;
+                    fan(x0 + 3 + (hr % 10), z0 + 3 + ((hr >> 5) % 10), WL + 0.55f, 0.4f + k3 * 2.5f, 0.8f + k3 * 2.8f, 0, 2 * PI, rgba(RGB(170, 185, 210), (int)(120 * (1 - k3))), 8);
+                }
+            }
+        }
+        (void)wv;
         if (t == T_PIER) {
             TEXS(TX_WOOD, 10);
             box(cx, WL + 0.2f, cz, 8, 0.7f, 8, 0, RGB(120, 92, 66), RGB(126, 98, 70), 1, 0);
@@ -4179,7 +4262,7 @@ static void draw_player(void)
 #endif
     if (P.state == PS_DEAD && mode == M_DEAD) return;
     if (P.iframes > 0 && P.iframes < 5000 && P.state != PS_ROLL && (frame & 2)) return;
-    hi_detail = 1;
+    hi_detail = perf_lvl == 0;
     pb_sc = CS;
 
     /* quanto si sta muovendo (per l'ampiezza del passo) */
@@ -6445,6 +6528,13 @@ void game_render(void)
     }
     camEye = eye;
     camFx = fx; camFz = fz;
+    {
+        float vx = eye.x - tgt.x, vy = eye.y - tgt.y, vz = eye.z - tgt.z, vl = sqrtf(vx * vx + vy * vy + vz * vz) + 0.001f, hl;
+        camVx = vx / vl; camVy = vy / vl; camVz = vz / vl;
+        camHx = 0.33f + camVx; camHy = 0.72f + camVy; camHz = 0.6f + camVz;
+        hl = sqrtf(camHx * camHx + camHy * camHy + camHz * camHz) + 0.001f;
+        camHx /= hl; camHy /= hl; camHz /= hl;
+    }
     {
         /* nebbia: col temporale vira al grigio-verde; il lampo la schiarisce per un attimo */
         uint32_t fc = FOGC;
