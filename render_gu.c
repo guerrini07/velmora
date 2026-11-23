@@ -38,7 +38,7 @@ static int curtex = -1;
 /* mipmap: versioni ridotte di ogni texture (1/2, 1/4, 1/8) per le superfici lontane:
  * niente sfarfallio e meno accessi alla memoria */
 #define NMIP 3
-static uint32_t *mips[MAXTEX][NMIP];
+static uint32_t *miplev[MAXTEX][NMIP];
 static uint32_t mipbuf[MAXTEX * (64 * 64 + 32 * 32 + 16 * 16)] __attribute__((aligned(16)));
 static int mip_ok;
 
@@ -53,7 +53,7 @@ static void build_mips(void)
         for (l = 0; l < NMIP; l++) {
             int ns = sz / 2;
             uint32_t *dst = mipbuf + used;
-            mips[t][l] = dst;
+            miplev[t][l] = dst;
             used += ns * ns;
             for (y = 0; y < ns; y++)
                 for (x = 0; x < ns; x++) {
@@ -79,7 +79,7 @@ static void bind_tex(int t)
     sceGuTexImage(0, texsize, texsize, texsize, texpix + t * texsize * texsize);
     if (mip_ok) {
         int l, sz = texsize / 2;
-        for (l = 0; l < NMIP; l++, sz /= 2) sceGuTexImage(l + 1, sz, sz, sz, mips[t][l]);
+        for (l = 0; l < NMIP; l++, sz /= 2) sceGuTexImage(l + 1, sz, sz, sz, miplev[t][l]);
     }
     sceGuTexFlush();
 }
